@@ -262,8 +262,6 @@ interface CompactResult {
   turnCount: number;
   /** Branches that fork off the main path before endId. */
   branches: BranchData[];
-  /** ID of the last entry before the compressed range (null = from root). */
-  anchorId: string | null;
 }
 
 /**
@@ -409,11 +407,6 @@ export async function executeCompact(
   // Collect branches that fork off the main path (preserved in new session)
   const branches = collectBranches(allEntries, byId, fullPath, endId);
 
-  // The anchor is the last entry before the compressed range.
-  const anchorId = segmentBC.length > 0
-    ? ((segmentBC[0].parentId as string | null) ?? null)
-    : null;
-
   // Drop mode: skip summary generation and just report the segments.
   if (config.drop) {
     return {
@@ -423,7 +416,6 @@ export async function executeCompact(
       segmentD,
       turnCount: fullEndTurn - fullStartTurn + 1,
       branches,
-      anchorId,
     };
   }
 
@@ -474,6 +466,5 @@ export async function executeCompact(
     segmentD,
     turnCount: fullEndTurn - fullStartTurn + 1,
     branches,
-    anchorId,
   };
 }

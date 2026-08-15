@@ -217,6 +217,7 @@ async function deleteAsNewSession(
   result: Awaited<ReturnType<typeof executeCompact>>,
   ctx: ExtensionCommandContext,
   config: DistillConfig,
+  markOld: boolean,
 ): Promise<void> {
   const oldSessionFile = ctx.sessionManager.getSessionFile();
   const oldTitle = ctx.sessionManager.getSessionName();
@@ -253,7 +254,7 @@ async function deleteAsNewSession(
     },
     withSession: async (freshCtx) => {
       const newSessionFile = freshCtx.sessionManager.getSessionFile();
-      if (oldSessionFile && newSessionFile) {
+      if (oldSessionFile && newSessionFile && markOld) {
         if (config.autoClean) {
           deleteSession(oldSessionFile);
         } else {
@@ -262,15 +263,19 @@ async function deleteAsNewSession(
           markDistilledTitle(oldSessionFile, oldTitle);
         }
       }
-      freshCtx.ui.notify("Deleted (new session)", "success");
+      freshCtx.ui.notify(
+        markOld ? "Deleted (new session)" : "Deleted in place",
+        "success",
+      );
     },
   });
 }
 
 /**
  * Handle `/distill del <label>`: delete the range without summarizing.
- * Presents three choices: new session (mark old distilled), delete in place,
- * or cancel.
+ * Presents three choices: new session (mark old distilled), delete in place
+ * (rebuild without marking), or cancel. Both delete paths rebuild the session
+ * without copying the removed range — mirroring distill, just without a summary.
  */
 async function handleDelete(
   label: string,
@@ -291,21 +296,9 @@ async function handleDelete(
     ]);
     if (choice === "Cancel" || choice === undefined) return;
 
-    if (choice === "New session (keep old as distilled)") {
-      await deleteAsNewSession(result, ctx, config);
-      return;
-    }
-
-    // Delete in place: rewind the leaf to just before the deleted range.
-    if (!result.anchorId) {
-      ctx.ui.notify(
-        "Cannot delete from the very start in place. Use the first option.",
-        "warning",
-      );
-      return;
-    }
-    await ctx.navigateTree(result.anchorId);
-    ctx.ui.notify("Deleted in place", "success");
+    // Both options rebuild via newSession; the only difference is whether the
+    // old session is marked as distilled.
+    await deleteAsNewSession(result, ctx, config, choice !== "Delete in place (no trace)");
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     ctx.ui.notify(`Delete failed: ${message}`, "error");
