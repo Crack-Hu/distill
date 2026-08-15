@@ -60,15 +60,12 @@ function extractText(content: unknown): string {
     .join("\n");
 }
 
-function extractToolCalls(content: unknown): string[] {
+function extractToolCalls(content: unknown): Array<{ name: string; arguments: Record<string, unknown> }> {
   if (!Array.isArray(content)) return [];
 
   return (content as ContentBlock[])
     .filter((c): c is ToolCallBlock => c.type === "toolCall" && typeof c.name === "string")
-    .map(
-      (c) =>
-        `[tool_call ${c.name}]\n${JSON.stringify(c.arguments ?? {})}`,
-    );
+    .map((c) => ({ name: c.name, arguments: c.arguments ?? {} }));
 }
 
 /** Extract the body from a `<distilled-summary>…</distilled-summary>` string. */
@@ -81,25 +78,30 @@ function extractDistilledBody(content: unknown): string {
 }
 
 /**
- * Convert content entries to a plain, identity-tagged text block.
- * Each entry is prefixed with who/what produced it: user, assistant,
- * tool_call, tool_result, or distilled_summary (a previously distilled
- * excerpt that sits at this point in the conversation).
+ * Convert content entries into a JSON array of role-tagged messages, so the
+ * summarizer parses the conversation structure unambiguously (no hallucinated
+ * attribution).
+ *
+ * Roles: user, assistant (optionally with tool_calls), tool_result, and
+ * distilled_summary (a previously distilled excerpt at this point).
  */
 export function formatMessages(entries: AnyEntry[]): string {
-  const lines: string[] = [];
+  const messages: Array<Record<string, unknown>> = [];
 
   for (const e of entries) {
     if (e.type === "message") {
       const m = e as MessageEntry;
       const role = m.message.role;
       if (role === "user") {
-        lines.push(`[user]\n${extractText(m.message.content)}`);
+        messages.push({ role: "user", content: extractText(m.message.content) });
       } else if (role === "assistant") {
         const text = extractText(m.message.content);
-        const tools = extractToolCalls(m.message.content);
-        if (text) lines.push(`[assistant]\n${text}`);
-        for (const tc of tools) lines.push(tc);
+        const toolCalls = extractToolCalls(m.message.content);
+        const msg: Record<string, unknown> = { role: "assistant", content: text };
+        if (toolCalls.length > 0) {
+          msg.tool_calls = toolCalls;
+        }
+        messages.push(msg);
       } else if (role === "toolResult") {
         const text = extractText(m.message.content);
         const preview =
@@ -107,18 +109,18 @@ export function formatMessages(entries: AnyEntry[]): string {
             ? text.slice(0, 500) + `\n... (truncated ${text.length - 500} chars)`
             : text;
         const toolName = (m.message as Record<string, unknown>).toolName ?? "tool";
-        lines.push(`[tool_result ${toolName}]\n${preview}`);
+        messages.push({ role: "tool_result", name: toolName, content: preview });
       }
     } else if (
       e.type === "custom_message" &&
       (e as { customType?: string }).customType === "distilled-summary"
     ) {
       const body = extractDistilledBody((e as { content?: unknown }).content);
-      lines.push(`[distilled_summary] 此处对话的摘要：\n${body}`);
+      messages.push({ role: "distilled_summary", content: body });
     }
   }
 
-  return lines.join("\n\n");
+  return JSON.stringify(messages, null, 2);
 }
 
 // ---- prompt assembly ------------------------------------------------------
