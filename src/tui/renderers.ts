@@ -51,12 +51,18 @@ export function registerRenderers(pi: ExtensionAPI): void {
 
     if (!expanded) {
       // Collapsed: header + blank line + first few lines of the body.
+      // Only show the expand hint when the body is actually truncated.
       const lines = body.split("\n");
-      const preview = lines.slice(0, 3).join("\n") + (lines.length > 3 ? "\n…" : "");
+      const hasMore = lines.length > 3;
+      const preview = lines.slice(0, 3).join("\n") + (hasMore ? "\n…" : "");
       const box = new Box(outputPad, 1, (t) => theme.bg("customMessageBg", t));
       box.addChild(new Text(theme.fg("accent", theme.bold(header)), 0, 0));
       box.addChild(new Text("", 0, 0));
       box.addChild(new Text(preview, 0, 0));
+      if (hasMore) {
+        box.addChild(new Text("", 0, 0));
+        box.addChild(new Text(theme.fg("dim", "Ctrl+O to expand"), 0, 0));
+      }
       return box;
     }
 
