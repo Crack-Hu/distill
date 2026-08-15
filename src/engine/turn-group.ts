@@ -119,18 +119,39 @@ export function groupIntoTurns(messages: MessageEntry[]): MessageEntry[][] {
 // ---- label resolution -----------------------------------------------------
 
 /**
- * Scan all entries for a label entry whose `label` field matches `name`.
- * Returns the `targetId` of the label (the entry it points to), or undefined.
+ * Resolve `name` to the first currently-active label target, in entry order.
+ * Uses pi's standard `getLabel` (backed by labelsById), which already applies
+ * override semantics — a later empty label entry clears the tag — so cleared
+ * labels are excluded automatically.
  */
 export function resolveLabel(
+  sm: { getLabel(id: string): string | undefined },
   allEntries: AnyEntry[],
   labelName: string,
 ): string | undefined {
-  const labelEntry = allEntries.find(
-    (e): e is LabelEntry =>
-      e.type === "label" && (e as LabelEntry).label === labelName,
-  );
-  return labelEntry ? (labelEntry as LabelEntry).targetId : undefined;
+  for (const e of allEntries) {
+    if (sm.getLabel(e.id as string) === labelName) return e.id as string;
+  }
+  return undefined;
+}
+
+/**
+ * Resolve `name` to EVERY currently-active label target, in entry order.
+ * Uses pi's standard `getLabel`, so re-tagged and cleared labels are handled
+ * exactly as the tree selector shows them.
+ */
+export function resolveAllLabels(
+  sm: { getLabel(id: string): string | undefined },
+  allEntries: AnyEntry[],
+  labelName: string,
+): string[] {
+  const result: string[] = [];
+  for (const e of allEntries) {
+    if (sm.getLabel(e.id as string) === labelName) {
+      result.push(e.id as string);
+    }
+  }
+  return result;
 }
 
 // ---- path building --------------------------------------------------------

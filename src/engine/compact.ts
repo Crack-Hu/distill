@@ -49,6 +49,10 @@ export interface CompactRange {
   startLabel: string;
   /** If set, end at this label; otherwise end at current leaf. */
   endLabel?: string;
+  /** Pre-resolved start entry ID (skips label lookup). */
+  startId?: string;
+  /** Pre-resolved end entry ID (skips label lookup). */
+  endId?: string;
   supplement?: string;
 }
 
@@ -295,17 +299,20 @@ export async function executeCompact(
     byId.set(e.id as string, e);
   }
 
-  // Resolve start label
-  const startId = resolveLabel(allEntries, range.startLabel);
+  // Resolve start label (pre-resolved ID wins over label lookup)
+  const startId = range.startId ?? resolveLabel(sm, allEntries, range.startLabel);
   if (!startId) {
     throw new Error(`Label "${range.startLabel}" not found. Create one via /tree → shift+L first.`);
   }
 
-  // Resolve end: either endLabel or current leaf
+  // Resolve end: pre-resolved ID, endLabel, or current leaf
   let endId: string;
   let endLabelDesc: string;
-  if (range.endLabel) {
-    const resolved = resolveLabel(allEntries, range.endLabel);
+  if (range.endId) {
+    endId = range.endId;
+    endLabelDesc = range.endLabel ?? "current position";
+  } else if (range.endLabel) {
+    const resolved = resolveLabel(sm, allEntries, range.endLabel);
     if (!resolved) {
       throw new Error(`Label "${range.endLabel}" not found.`);
     }
@@ -330,8 +337,10 @@ export async function executeCompact(
   const leafId = sm.getLeafId();
   const fullPath = buildFullPath(byId, leafId);
 
-  // Branch check — reject if branches inside compressed range
-  if (hasBranchInRange(allEntries, byId, startId, endId)) {
+  // Branch check — reject if branches inside compressed range. Children that
+  // continue the main path (root → leaf) past endId are segmentD, not forks.
+  const fullPathIds = new Set(fullPath.map((e) => e.id as string));
+  if (hasBranchInRange(allEntries, byId, startId, endId, fullPathIds)) {
     throw new Error(
       "Branch detected in range — not supported yet. Distill before/after the branch point separately.",
     );

@@ -14,6 +14,7 @@ import {
 
 import { executeCompact } from "../engine/compact";
 import type { DistillConfig } from "../engine/compact";
+import { resolveAllLabels } from "../engine/turn-group";
 import { deleteSession, setParentSession } from "../engine/session-io";
 
 // ---- config I/O -----------------------------------------------------------
@@ -271,6 +272,229 @@ async function deleteAsNewSession(
   });
 }
 
+// ---- label disambiguation ------------------------------------------------
+
+/** Extract plain text from a message content (string or content blocks). */
+function textFromMessage(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((c) => c?.type === "text" && typeof c.text === "string")
+      .map((c) => c.text)
+      .join("\n");
+  }
+  return "";
+}
+
+function truncate(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n)}…` : s;
+}
+
+/**
+ * Build a short human-readable description of where a label sits, e.g.
+ * `user: "说234"`. Prefers the tagged node itself when it is a message;
+ * otherwise falls back to the next user message after it on the current
+ * path. Used to disambiguate duplicate labels in pickers.
+ */
+function describeTagPosition(
+  targetId: string,
+  ctx: ExtensionCommandContext,
+): string {
+  try {
+    const allEntries = ctx.sessionManager.getEntries() as Array<
+      Record<string, unknown>
+    >;
+    const byId = new Map(allEntries.map((e) => [e.id as string, e]));
+
+    // The tagged node itself — most informative when it is a message.
+    const node = byId.get(targetId);
+    if (node && node.type === "message") {
+      const role = (node as { message?: { role?: string } }).message?.role;
+      const text = textFromMessage(
+        (node as { message: { content: unknown } }).message?.content,
+      )
+        .trim()
+        .replace(/\s+/g, " ");
+      if (text) return `${role ?? "msg"}: \"${truncate(text, 30)}\"`;
+      return role ?? "msg";
+    }
+
+    // Non-message target: locate it on the root → leaf path and show the
+    // next user message at/after it.
+    const leafId = ctx.sessionManager.getLeafId();
+    if (!leafId) return "";
+    const path: Array<Record<string, unknown>> = [];
+    let cur = byId.get(leafId);
+    const seen = new Set<string>();
+    while (cur && !seen.has(cur.id as string)) {
+      seen.add(cur.id as string);
+      path.unshift(cur);
+      const pid = cur.parentId as string | null;
+      if (!pid) break;
+      cur = byId.get(pid);
+    }
+
+    const idx = path.findIndex((e) => e.id === targetId);
+    if (idx === -1) return "(off current path)";
+    for (let i = idx; i < path.length; i++) {
+      const e = path[i];
+      if (e.type === "message") {
+        const role = (e as { message?: { role?: string } }).message?.role;
+        if (role === "user") {
+          const text = textFromMessage(
+            (e as { message: { content: unknown } }).message.content,
+          )
+            .trim()
+            .replace(/\s+/g, " ");
+          if (text) return `after \"${truncate(text, 30)}\"`;
+        }
+      }
+    }
+    return "(end of path)";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Pick one candidate when a label appears multiple times. Returns the chosen
+ * targetId, or null if the user cancels.
+ */
+async function pickLabelCandidate(
+  candidates: string[],
+  labelName: string,
+  role: string,
+  ctx: ExtensionCommandContext,
+): Promise<string | null> {
+  if (candidates.length === 1) return candidates[0];
+  const options = candidates.map(
+    (id, i) => `#${i + 1} ${describeTagPosition(id, ctx)}`.trim(),
+  );
+  const chosen = await ctx.ui.select(
+    `Label "${labelName}" appears ${candidates.length} times — pick the ${role} tag`,
+    options,
+  );
+  if (chosen === undefined) return null;
+  const idx = options.indexOf(chosen);
+  return candidates[idx] ?? null;
+}
+
+/**
+ * Resolve a label pair to concrete entry IDs, prompting the user when a
+ * label appears multiple times in the tree.
+ *
+ * Single label (`/distill tag`):
+ *   1 match   → tag → current position
+ *   2 matches → ask: between the two / up to the first / up to the last
+ *   >2 matches→ ask which tag to compress up to
+ *
+ * Two labels (`/distill tag1 tag2`): each ambiguous label prompts a picker.
+ * Returns null when the user cancels.
+ */
+async function resolveRange(
+  args: { startLabel: string; endLabel?: string },
+  ctx: ExtensionCommandContext,
+): Promise<{ startId: string; endId: string } | null> {
+  const allEntries = ctx.sessionManager.getEntries() as Array<
+    Record<string, unknown>
+  >;
+  const startCandidates = resolveAllLabels(
+    ctx.sessionManager,
+    allEntries,
+    args.startLabel,
+  );
+  if (startCandidates.length === 0) {
+    throw new Error(
+      `Label "${args.startLabel}" not found. Create one via /tree → shift+L first.`,
+    );
+  }
+
+  const leafId = ctx.sessionManager.getLeafId();
+  if (!leafId) throw new Error("Cannot determine current leaf node.");
+
+  // Two-label form.
+  if (args.endLabel) {
+    // Same-name pair (`/distill tag tag`): the intent is "between the two
+    // tags". With exactly two occurrences, compress between them directly.
+    if (args.endLabel === args.startLabel) {
+      if (startCandidates.length === 2) {
+        return { startId: startCandidates[0], endId: startCandidates[1] };
+      }
+      const startId = await pickLabelCandidate(
+        startCandidates,
+        args.startLabel,
+        "start",
+        ctx,
+      );
+      if (!startId) return null;
+      const rest = startCandidates.filter((id) => id !== startId);
+      if (rest.length === 0) return null;
+      if (rest.length === 1) return { startId, endId: rest[0] };
+      const endId = await pickLabelCandidate(
+        rest,
+        args.startLabel,
+        "end",
+        ctx,
+      );
+      if (!endId) return null;
+      return { startId, endId };
+    }
+
+    const endCandidates = resolveAllLabels(
+      ctx.sessionManager,
+      allEntries,
+      args.endLabel,
+    );
+    if (endCandidates.length === 0) {
+      throw new Error(
+        `Label "${args.endLabel}" not found. Create one via /tree → shift+L first.`,
+      );
+    }
+    const startId = await pickLabelCandidate(
+      startCandidates,
+      args.startLabel,
+      "start",
+      ctx,
+    );
+    if (!startId) return null;
+    const endId = await pickLabelCandidate(
+      endCandidates,
+      args.endLabel,
+      "end",
+      ctx,
+    );
+    if (!endId) return null;
+    return { startId, endId };
+  }
+
+  // Single-label form.
+  if (startCandidates.length === 1) {
+    return { startId: startCandidates[0], endId: leafId };
+  }
+
+  if (startCandidates.length === 2) {
+    const [first, last] = startCandidates;
+    const choice = await ctx.ui.select(
+      `Label "${args.startLabel}" appears twice — compress what?`,
+      ["Between the two tags", "Up to the first tag", "Up to the last tag"],
+    );
+    if (choice === undefined) return null;
+    if (choice === "Between the two tags") return { startId: first, endId: last };
+    if (choice === "Up to the first tag") return { startId: first, endId: leafId };
+    return { startId: last, endId: leafId };
+  }
+
+  // More than two matches: pick which tag to compress up to.
+  const startId = await pickLabelCandidate(
+    startCandidates,
+    args.startLabel,
+    "start",
+    ctx,
+  );
+  if (!startId) return null;
+  return { startId, endId: leafId };
+}
+
 /**
  * Handle `/distill del <label>`: delete the range without summarizing.
  * Presents three choices: new session (mark old distilled), delete in place
@@ -283,8 +507,16 @@ async function handleDelete(
   config: DistillConfig,
 ): Promise<void> {
   try {
+    // Resolve the label first — duplicate tags prompt the user to disambiguate.
+    const range = await resolveRange({ startLabel: label }, ctx);
+    if (!range) return; // user cancelled
+
     const result = await executeCompact(
-      { startLabel: label },
+      {
+        startLabel: label,
+        startId: range.startId,
+        endId: range.endId,
+      },
       { ...config, drop: true },
       ctx,
     );
@@ -441,11 +673,24 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
       }
 
       try {
+        // Resolve labels to concrete entry IDs — duplicate tags prompt the
+        // user to disambiguate before any work happens.
+        const range = await resolveRange(
+          {
+            startLabel: parts.labels[0],
+            endLabel: parts.labels.length > 1 ? parts.labels[1] : undefined,
+          },
+          ctx,
+        );
+        if (!range) return; // user cancelled
+
         // Run compact engine
         const result = await executeCompact(
           {
             startLabel: parts.labels[0],
             endLabel: parts.labels.length > 1 ? parts.labels[1] : undefined,
+            startId: range.startId,
+            endId: range.endId,
             supplement: parts.supplement,
           },
           config,
