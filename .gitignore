@@ -6,3 +6,8 @@ config.json
 
 # macOS
 .DS_Store
+
+# 测试脚本依赖链接（指向 pi 安装目录）
+node_modules/
+tests/
+
