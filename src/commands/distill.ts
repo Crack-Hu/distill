@@ -268,7 +268,7 @@ async function deleteAsNewSession(
 }
 
 /**
- * Handle `/distill <label> del`: delete the range without summarizing.
+ * Handle `/distill del <label>`: delete the range without summarizing.
  * Presents three choices: new session (mark old distilled), delete in place,
  * or cancel.
  */
@@ -339,7 +339,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
 
   pi.registerCommand("distill", {
     description:
-      "Context distill: /distill <label> [supplement] or /distill <label1> <label2> [supplement]; /distill <label> del deletes a range",
+      "Context distill: /distill <label> [supplement] or /distill <label1> <label2> [supplement]; /distill del <label> deletes a range",
     getArgumentCompletions: (argumentPrefix) => {
       const prefix = argumentPrefix.trim().toLowerCase();
       if (!prefix) return subcommandCompletions;
@@ -423,14 +423,12 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
         return;
       }
 
-      // /distill <label> del — delete the range without summarizing
-      const delMatch = /^(.+?)\s+del$/i.exec(trimmed);
+      // /distill del [<label>] — delete the range without summarizing.
+      // With no explicit label, "del" itself is the label (a tag named
+      // "del" is deleted up to the current position).
+      const delMatch = /^del(?:\s+(.+))?$/i.exec(trimmed);
       if (delMatch) {
-        const label = delMatch[1].trim();
-        if (!label) {
-          ctx.ui.notify("Usage: /distill <label> del", "warning");
-          return;
-        }
+        const label = delMatch[1]?.trim() ?? "del";
         await handleDelete(label, ctx, config);
         return;
       }
@@ -442,7 +440,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
       if (parts.labels.length === 0) {
         ctx.ui.notify(
           "Usage: /distill <label> [supplement]  or  /distill <label1> <label2> [supplement]\n" +
-            "  /distill <label> del  deletes the range without summarizing\n" +
+            "  /distill del <label>  deletes the range without summarizing\n" +
             "Sub-commands: context on|off  /  auto-clean on|off  /  model  /  clean",
           "warning",
         );
