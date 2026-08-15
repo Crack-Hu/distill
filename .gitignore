@@ -1,0 +1,8 @@
+# 运行时日志（每次压缩的 prompt 记录）
+logs/
+
+# 本地配置（含用户的模型选择等环境信息）
+config.json
+
+# macOS
+.DS_Store

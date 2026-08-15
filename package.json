@@ -1,0 +1,5 @@
+{
+  "name": "distill",
+  "version": "1.0.0",
+  "description": "Manual context compression extension — distill conversation ranges into summaries and rebuild sessions"
+}
