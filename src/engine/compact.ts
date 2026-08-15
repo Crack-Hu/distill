@@ -67,6 +67,7 @@ function hasBranchInRange(
   byId: Map<string, Record<string, unknown>>,
   startId: string,
   endId: string,
+  fullPathIds: Set<string>,
 ): boolean {
   let current: Record<string, unknown> | undefined = byId.get(endId);
   const pathIds = new Set<string>();
@@ -82,7 +83,16 @@ function hasBranchInRange(
     const children = messageEntries.filter(
       (e) => (e.parentId as string | null) === id,
     );
-    if (children.some((c) => !pathIds.has(c.id as string))) return true;
+    // A child that continues the main path (root → leaf) past endId is
+    // segmentD, not a fork — only off-path children are branches.
+    if (
+      children.some(
+        (c) =>
+          !pathIds.has(c.id as string) && !fullPathIds.has(c.id as string),
+      )
+    ) {
+      return true;
+    }
   }
   return false;
 }
