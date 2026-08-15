@@ -69,6 +69,10 @@ export function filterMessageEntries(
  * messages, labels, model changes, custom entries — is attached to the current
  * turn. Non-message entries before the first user message form a "prelude"
  * turn (empty messages array).
+ *
+ * A distilled summary (compactionSummary) also starts a new turn: it is a
+ * standalone node, not part of a question → answer pair, matching pi's
+ * isTurnStartMessage behavior.
  */
 export function groupPathIntoTurns(path: AnyEntry[]): Turn[] {
   const turns: Turn[] = [];
@@ -77,7 +81,8 @@ export function groupPathIntoTurns(path: AnyEntry[]): Turn[] {
   for (const e of path) {
     if (e.type === "message") {
       const msg = e as MessageEntry;
-      if (msg.message.role === "user") {
+      const role = msg.message.role;
+      if (role === "user" || role === "compactionSummary") {
         if (current) turns.push(current);
         current = { entries: [e], messages: [msg] };
       } else {
