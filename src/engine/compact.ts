@@ -116,7 +116,7 @@ export interface BranchData {
  * range — branches after endId are not preserved (they are replaced by the
  * summary → segmentD chain).
  */
-function collectBranches(
+export function collectBranches(
   allEntries: Array<Record<string, unknown>>,
   byId: Map<string, Record<string, unknown>>,
   fullPath: Array<Record<string, unknown>>,
@@ -194,11 +194,9 @@ function getBackgroundMessages(
   if (startIdx <= 0) return [];
 
   const before = chrono.slice(0, startIdx);
-  const content = before.filter((e) =>
-    e.type === "message" ||
-    (e.type === "custom_message" &&
-      (e as { customType?: string }).customType === "distilled-summary"),
-  ) as AnyEntry[];
+  // All message entries count as background — including previously distilled
+  // summaries (stored as compactionSummary messages).
+  const content = before.filter((e) => e.type === "message") as AnyEntry[];
 
   if (contextOn) return content;
 
@@ -388,7 +386,10 @@ export async function executeCompact(
     throw new Error(`End label target is not in the message path.`);
   }
 
-  // Segments — preserve ALL entry types
+  // Segments — preserve ALL entry types. Turn boundaries are respected so a
+  // "question → answer" pair is never split: a label placed on an assistant
+  // reply pulls its whole turn (including the leading user message) into the
+  // compressed range.
   const segmentA: AnyEntry[] = [];
   for (let i = 0; i < fullStartTurn; i++) {
     segmentA.push(...turns[i].entries);
@@ -396,15 +397,12 @@ export async function executeCompact(
 
   const segmentBCTurns = turns.slice(fullStartTurn, fullEndTurn + 1);
   // Include messages AND previously distilled summaries, so a second distill
-  // never drops the first one's content.
+  // never drops the first one's content. (Distilled summaries are stored as
+  // compactionSummary messages, so plain message entries cover both.)
   const segmentBC: AnyEntry[] = [];
   for (const t of segmentBCTurns) {
     for (const e of t.entries) {
-      if (
-        e.type === "message" ||
-        (e.type === "custom_message" &&
-          (e as { customType?: string }).customType === "distilled-summary")
-      ) {
+      if (e.type === "message") {
         segmentBC.push(e);
       }
     }
@@ -414,6 +412,9 @@ export async function executeCompact(
   for (let i = fullEndTurn + 1; i < turns.length; i++) {
     segmentD.push(...turns[i].entries);
   }
+
+  // Number of conversation turns inside the compressed range.
+  const turnCount = fullEndTurn - fullStartTurn + 1;
 
   // Get background messages
   const backgroundMessages = getBackgroundMessages(
@@ -433,7 +434,7 @@ export async function executeCompact(
       segmentA,
       segmentBC,
       segmentD,
-      turnCount: fullEndTurn - fullStartTurn + 1,
+      turnCount,
       branches,
     };
   }
@@ -483,7 +484,7 @@ export async function executeCompact(
     segmentA,
     segmentBC,
     segmentD,
-    turnCount: fullEndTurn - fullStartTurn + 1,
+    turnCount,
     branches,
   };
 }

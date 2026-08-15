@@ -12,12 +12,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { registerDistillCommand, registerSessionGuards } from "./src/commands/distill";
 import { registerViewDistilledTool } from "./src/tools/view-distilled";
-import { registerRenderers } from "./src/tui/renderers";
 
 export default function (pi: ExtensionAPI) {
-  // Register TUI renderers for distilled-summary and distilled-archive
-  registerRenderers(pi);
-
   // Register the /distill command
   registerDistillCommand(pi);
 

@@ -12,7 +12,7 @@ import {
   type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 
-import { executeCompact } from "../engine/compact";
+import { collectBranches, executeCompact } from "../engine/compact";
 import type { DistillConfig } from "../engine/compact";
 import { resolveAllLabels } from "../engine/turn-group";
 import { deleteSession, setParentSession } from "../engine/session-io";
@@ -495,11 +495,99 @@ async function resolveRange(
   return { startId, endId: leafId };
 }
 
+/** Rough token estimate for a range of entries (chars / 4). */
+function estimateTokens(entries: Array<Record<string, unknown>>): number {
+  let chars = 0;
+  for (const e of entries) {
+    if (e.type !== "message") continue;
+    const content = (e as { message?: { content?: unknown } }).message?.content;
+    if (typeof content === "string") {
+      chars += content.length;
+    } else if (Array.isArray(content)) {
+      for (const b of content) {
+        if (
+          b &&
+          typeof b === "object" &&
+          (b as { type?: string }).type === "text" &&
+          typeof (b as { text?: unknown }).text === "string"
+        ) {
+          chars += (b as { text: string }).text.length;
+        }
+      }
+    }
+  }
+  return Math.max(1, Math.ceil(chars / 4));
+}
+
+/**
+ * Delete a single standalone entry (e.g. a distilled summary) by rebuilding
+ * the session without it. The entry must sit on the current path; entries
+ * after it (segmentD) are re-appended under its predecessor.
+ *
+ * If the deleted entry is a fork point, its off-path branches are re-attached
+ * to the entry's parent so they survive the deletion. Branch promotion is
+ * impossible for the root entry, so that case is rejected.
+ */
+async function deleteSingleEntry(
+  targetId: string,
+  ctx: ExtensionCommandContext,
+  config: DistillConfig,
+  markOld: boolean,
+): Promise<void> {
+  const sm = ctx.sessionManager;
+  const allEntries = sm.getEntries() as Array<Record<string, unknown>>;
+  const byId = new Map(allEntries.map((e) => [e.id as string, e]));
+  const leafId = sm.getLeafId();
+  if (!leafId) throw new Error("Cannot determine current leaf node.");
+
+  // Full root → leaf path
+  const fullPath: Array<Record<string, unknown>> = [];
+  let cur = byId.get(leafId);
+  const seen = new Set<string>();
+  while (cur && !seen.has(cur.id as string)) {
+    seen.add(cur.id as string);
+    fullPath.unshift(cur);
+    const pid = cur.parentId as string | null;
+    if (!pid) break;
+    cur = byId.get(pid);
+  }
+  const idx = fullPath.findIndex((e) => e.id === targetId);
+  if (idx === -1) throw new Error("Target entry is not on the current path.");
+  if (idx === 0) {
+    throw new Error(
+      "Cannot delete the root entry alone — use range delete instead.",
+    );
+  }
+
+  // Branches forking off the kept part are preserved (same mechanism as
+  // range delete). If the deleted entry itself is a fork point, its branches
+  // are re-attached to the entry's parent so they survive the deletion.
+  const parentId = fullPath[idx].parentId as string | null;
+  const branches = collectBranches(allEntries, byId, fullPath, targetId).map(
+    (b) => (b.branchPointId === targetId && parentId ? { ...b, branchPointId: parentId } : b),
+  );
+
+  const result: Awaited<ReturnType<typeof executeCompact>> = {
+    summary: "",
+    segmentA: fullPath.slice(0, idx),
+    segmentBC: [fullPath[idx]],
+    segmentD: fullPath.slice(idx + 1),
+    turnCount: 0,
+    branches,
+  };
+  await deleteAsNewSession(result, ctx, config, markOld);
+}
+
 /**
  * Handle `/distill del <label>`: delete the range without summarizing.
  * Presents three choices: new session (mark old distilled), delete in place
  * (rebuild without marking), or cancel. Both delete paths rebuild the session
  * without copying the removed range — mirroring distill, just without a summary.
+ *
+ * When the label points to a standalone non-message entry (e.g. a distilled
+ * summary), an extra "delete this entry only" option is offered — a single
+ * user/assistant message is never deletable alone because it would break the
+ * dialogue flow.
  */
 async function handleDelete(
   label: string,
@@ -511,6 +599,49 @@ async function handleDelete(
     const range = await resolveRange({ startLabel: label }, ctx);
     if (!range) return; // user cancelled
 
+    // A tag may point to a standalone entry (e.g. a distilled summary).
+    // Only standalone entries can be deleted on their own: non-message
+    // entries, or a distilled summary (compactionSummary message).
+    // user/assistant messages belong to a turn and are only removable as a
+    // range.
+    const allEntries = ctx.sessionManager.getEntries() as Array<
+      Record<string, unknown>
+    >;
+    const target = allEntries.find((e) => e.id === range.startId);
+    const targetRole = (target as { message?: { role?: string } } | undefined)
+      ?.message?.role;
+    const deletable =
+      target !== undefined &&
+      (target.type !== "message" || targetRole === "compactionSummary");
+
+    // Step 1 — deletion granularity (only when the tagged entry is
+    // standalone and can be removed on its own).
+    let single = false;
+    if (deletable) {
+      const how = await ctx.ui.select(
+        `Label "${label}" points to a single entry — delete how?`,
+        ["This entry only", "The whole range", "Cancel"],
+      );
+      if (how === undefined || how === "Cancel") return;
+      single = how === "This entry only";
+    }
+
+    // Step 2 — old session handling (both granularities share this).
+    const markChoice = await ctx.ui.select("Delete method", [
+      "New session (keep old as distilled)",
+      "In place (no trace)",
+      "Cancel",
+    ]);
+    if (markChoice === undefined || markChoice === "Cancel") return;
+    const markOld = markChoice === "New session (keep old as distilled)";
+
+    if (single) {
+      await deleteSingleEntry(range.startId, ctx, config, markOld);
+      return;
+    }
+
+    // Range deletion: rebuild via newSession; the only difference between
+    // the two options is whether the old session is marked as distilled.
     const result = await executeCompact(
       {
         startLabel: label,
@@ -520,17 +651,7 @@ async function handleDelete(
       { ...config, drop: true },
       ctx,
     );
-
-    const choice = await ctx.ui.select("Delete this range", [
-      "New session (keep old as distilled)",
-      "Delete in place (no trace)",
-      "Cancel",
-    ]);
-    if (choice === "Cancel" || choice === undefined) return;
-
-    // Both options rebuild via newSession; the only difference is whether the
-    // old session is marked as distilled.
-    await deleteAsNewSession(result, ctx, config, choice !== "Delete in place (no trace)");
+    await deleteAsNewSession(result, ctx, config, markOld);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     ctx.ui.notify(`Delete failed: ${message}`, "error");
@@ -734,27 +855,23 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
             // Return to the anchor (last entry before compressed range)
             if (anchorNewId) sm.branch(anchorNewId);
 
-            // Insert distilled summary (wrapped in a self-identifying header).
+            // Insert the distilled summary as a native compactionSummary
+            // message (a top-level message, NOT a custom_message). This makes
+            // it a node you can continue from: the tree selector keeps the
+            // leaf ON this entry, whereas custom_message entries move the leaf
+            // to the parent and stuff the content into the editor.
             // The <distilled-summary> tag tells the LLM this is NOT a user
-            // message, and the turns/messages attrs convey the compression
-            // granularity. Its position in the flow is the "this point" anchor.
+            // message; turns/messages attrs convey the compression granularity.
             const summaryContent =
               `<distilled-summary turns="${result.turnCount}" messages="${result.segmentBC.length}">\n` +
               `${finalSummary}\n` +
               `</distilled-summary>`;
-            sm.appendCustomMessageEntry(
-              "distilled-summary",
-              summaryContent,
-              true,
-              {
-                range: {
-                  startLabel: parts.labels[0],
-                  endLabel:
-                    parts.labels.length > 1 ? parts.labels[1] : undefined,
-                },
-                turnCount: result.turnCount,
-              },
-            );
+            sm.appendMessage({
+              role: "compactionSummary",
+              summary: summaryContent,
+              tokensBefore: estimateTokens(result.segmentBC),
+              timestamp: Date.now(),
+            });
 
             // Copy segment D (all entry types)
             for (const entry of result.segmentD) {

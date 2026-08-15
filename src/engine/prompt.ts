@@ -110,13 +110,13 @@ export function formatMessages(entries: AnyEntry[]): string {
             : text;
         const toolName = (m.message as Record<string, unknown>).toolName ?? "tool";
         messages.push({ role: "tool_result", name: toolName, content: preview });
+      } else if (role === "compactionSummary") {
+        // A previously distilled summary (stored as a compactionSummary message)
+        const body = extractDistilledBody(
+          (m.message as { summary?: unknown }).summary,
+        );
+        messages.push({ role: "distilled_summary", content: body });
       }
-    } else if (
-      e.type === "custom_message" &&
-      (e as { customType?: string }).customType === "distilled-summary"
-    ) {
-      const body = extractDistilledBody((e as { content?: unknown }).content);
-      messages.push({ role: "distilled_summary", content: body });
     }
   }
 
