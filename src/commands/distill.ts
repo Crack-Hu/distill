@@ -595,6 +595,8 @@ export function registerSessionGuards(pi: ExtensionAPI): void {
   pi.on("session_start", (event, ctx) => {
     const file = ctx.sessionManager.getSessionFile();
     currentDistilled = file ? isDistilledSession(file) : false;
+    // Clear any lingering fork hint from a previous session.
+    ctx.ui.setWidget("distill", undefined);
   });
 
   // Intercept the first message in a distilled session: prefill a fork
@@ -606,10 +608,12 @@ export function registerSessionGuards(pi: ExtensionAPI): void {
     if (!text || text.startsWith("/")) return { action: "continue" as const };
 
     const sessionFile = ctx.sessionManager.getSessionFile();
-    ctx.ui.notify(
-      "Distilled session is read-only — forking to continue.",
-      "info",
-    );
+    ctx.ui.setWidget("distill", [
+      ctx.ui.theme.fg(
+        "dim",
+        "Distilled session is read-only. To continue, run /distill fork (prefilled in input) — press Enter.",
+      ),
+    ]);
     ctx.ui.setEditorText(
       `/distill fork ${JSON.stringify(sessionFile)} ${JSON.stringify(text)}`,
     );
