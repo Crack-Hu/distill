@@ -14,7 +14,7 @@ import {
 
 import { collectBranches, executeCompact } from "../engine/compact";
 import type { DistillConfig } from "../engine/compact";
-import { resolveAllLabels } from "../engine/turn-group";
+import { groupPathIntoTurns, resolveAllLabels } from "../engine/turn-group";
 import { deleteSession, setParentSession } from "../engine/session-io";
 
 // ---- config I/O -----------------------------------------------------------
@@ -520,13 +520,14 @@ function estimateTokens(entries: Array<Record<string, unknown>>): number {
 }
 
 /**
- * Delete a single standalone entry (e.g. a distilled summary) by rebuilding
- * the session without it. The entry must sit on the current path; entries
- * after it (segmentD) are re-appended under its predecessor.
+ * Delete a single distilled summary (a standalone compactionSummary message)
+ * by rebuilding the session without it. Follows turn semantics: the summary
+ * is its own turn, so deleting it deletes exactly that turn — question →
+ * answer pairs around it stay intact.
  *
- * If the deleted entry is a fork point, its off-path branches are re-attached
- * to the entry's parent so they survive the deletion. Branch promotion is
- * impossible for the root entry, so that case is rejected.
+ * If the deleted summary is a fork point, its off-path branches are
+ * re-attached to the last kept entry so they survive the deletion. Branch
+ * promotion is impossible for the first turn, so that case is rejected.
  */
 async function deleteSingleEntry(
   targetId: string,
@@ -551,28 +552,46 @@ async function deleteSingleEntry(
     if (!pid) break;
     cur = byId.get(pid);
   }
-  const idx = fullPath.findIndex((e) => e.id === targetId);
-  if (idx === -1) throw new Error("Target entry is not on the current path.");
-  if (idx === 0) {
+
+  // Turn logic: the deleted range is the turn containing the summary. Since a
+  // distilled summary is its own turn, this removes exactly the summary while
+  // keeping the surrounding question → answer turns intact.
+  const turns = groupPathIntoTurns(fullPath);
+  const turnIdx = turns.findIndex((t) =>
+    t.entries.some((e) => e.id === targetId),
+  );
+  if (turnIdx === -1) {
+    throw new Error("Target entry is not on the current path.");
+  }
+  if (turnIdx === 0) {
     throw new Error(
-      "Cannot delete the root entry alone — use range delete instead.",
+      "Cannot delete the first turn alone — use range delete instead.",
     );
   }
+  const targetTurn = turns[turnIdx];
 
-  // Branches forking off the kept part are preserved (same mechanism as
-  // range delete). If the deleted entry itself is a fork point, its branches
-  // are re-attached to the entry's parent so they survive the deletion.
-  const parentId = fullPath[idx].parentId as string | null;
-  const branches = collectBranches(allEntries, byId, fullPath, targetId).map(
-    (b) => (b.branchPointId === targetId && parentId ? { ...b, branchPointId: parentId } : b),
+  // Branches forking off the kept part are preserved. If the deleted summary
+  // is a fork point, its branches are re-attached to the last kept entry.
+  const lastKept = turns[turnIdx - 1].entries[
+    turns[turnIdx - 1].entries.length - 1
+  ];
+  const parentId = lastKept?.id as string | undefined;
+  const turnEndId = targetTurn.entries[
+    targetTurn.entries.length - 1
+  ].id as string;
+  const branches = collectBranches(allEntries, byId, fullPath, turnEndId).map(
+    (b) =>
+      b.branchPointId === targetId && parentId
+        ? { ...b, branchPointId: parentId }
+        : b,
   );
 
   const result: Awaited<ReturnType<typeof executeCompact>> = {
     summary: "",
-    segmentA: fullPath.slice(0, idx),
-    segmentBC: [fullPath[idx]],
-    segmentD: fullPath.slice(idx + 1),
-    turnCount: 0,
+    segmentA: turns.slice(0, turnIdx).flatMap((t) => t.entries),
+    segmentBC: targetTurn.entries.filter((e) => e.type === "message"),
+    segmentD: turns.slice(turnIdx + 1).flatMap((t) => t.entries),
+    turnCount: 1,
     branches,
   };
   await deleteAsNewSession(result, ctx, config, markOld);
@@ -599,32 +618,17 @@ async function handleDelete(
     const range = await resolveRange({ startLabel: label }, ctx);
     if (!range) return; // user cancelled
 
-    // A tag may point to a standalone entry (e.g. a distilled summary).
-    // Only standalone entries can be deleted on their own: non-message
-    // entries, or a distilled summary (compactionSummary message).
-    // user/assistant messages belong to a turn and are only removable as a
-    // range.
-    const allEntries = ctx.sessionManager.getEntries() as Array<
-      Record<string, unknown>
-    >;
-    const target = allEntries.find((e) => e.id === range.startId);
-    const targetRole = (target as { message?: { role?: string } } | undefined)
-      ?.message?.role;
-    const deletable =
-      target !== undefined &&
-      (target.type !== "message" || targetRole === "compactionSummary");
-
-    // Step 1 — deletion granularity (only when the tagged entry is
-    // standalone and can be removed on its own).
-    let single = false;
-    if (deletable) {
-      const how = await ctx.ui.select(
-        `Label "${label}" points to a single entry — delete how?`,
-        ["This entry only", "The whole range", "Cancel"],
-      );
-      if (how === undefined || how === "Cancel") return;
-      single = how === "This entry only";
-    }
+    // Step 1 — deletion granularity. The tagged entry's own turn can be
+    // deleted alone ("This turn only"), or the whole range up to the current
+    // position can be deleted. Both follow turn semantics: a distilled
+    // summary is its own turn, so deleting it deletes exactly the summary;
+    // a user/assistant message deletes its whole question → answer turn.
+    const how = await ctx.ui.select(
+      `Label "${label}" points to a single entry — delete how?`,
+      ["This turn only", "The whole range", "Cancel"],
+    );
+    if (how === undefined || how === "Cancel") return;
+    const single = how === "This turn only";
 
     // Step 2 — old session handling (both granularities share this).
     const markChoice = await ctx.ui.select("Delete method", [
