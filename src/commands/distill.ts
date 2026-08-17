@@ -664,6 +664,181 @@ async function handleDelete(
   }
 }
 
+/**
+ * Merge a distilled summary from a side branch into the main path, placing a
+ * copy of it right after the fork turn it originated from. Only a
+ * compactionSummary can be merged — copying an ordinary user/assistant
+ * message would drag its question → answer pair into a foreign position and
+ * corrupt the context.
+ */
+async function handleMerge(
+  srcLabel: string,
+  ctx: ExtensionCommandContext,
+  config: DistillConfig,
+): Promise<void> {
+  try {
+    // Resolve the label — duplicate tags prompt the user to disambiguate.
+    const range = await resolveRange({ startLabel: srcLabel }, ctx);
+    if (!range) return; // user cancelled
+    const srcId = range.startId;
+
+    const sm = ctx.sessionManager;
+    const allEntries = sm.getEntries() as Array<Record<string, unknown>>;
+    const byId = new Map(allEntries.map((e) => [e.id as string, e]));
+
+    // Source must be a distilled summary.
+    const srcEntry = byId.get(srcId);
+    const srcRole = (
+      srcEntry as { message?: { role?: string } } | undefined
+    )?.message?.role;
+    if (!srcEntry || srcEntry.type !== "message" || srcRole !== "compactionSummary") {
+      ctx.ui.notify(
+        "Merge source must be a distilled summary (compactionSummary).",
+        "warning",
+      );
+      return;
+    }
+
+    // The summary must be the first message of a branch: its parent is the
+    // fork point, and that parent must have more than one child branch.
+    const parentId = srcEntry.parentId as string | null;
+    if (!parentId) {
+      ctx.ui.notify("Summary has no parent node.", "warning");
+      return;
+    }
+    const parentChildren = allEntries.filter(
+      (e) => (e.parentId as string | null) === parentId,
+    );
+    if (parentChildren.length <= 1) {
+      ctx.ui.notify(
+        "Parent node has only one branch — nothing to merge.",
+        "warning",
+      );
+      return;
+    }
+
+    // Main path (root → leaf).
+    const leafId = sm.getLeafId();
+    if (!leafId) throw new Error("Cannot determine current leaf node.");
+    const mainPath: Array<Record<string, unknown>> = [];
+    let cur = byId.get(leafId);
+    const seen = new Set<string>();
+    while (cur && !seen.has(cur.id as string)) {
+      seen.add(cur.id as string);
+      mainPath.unshift(cur);
+      const pid = cur.parentId as string | null;
+      if (!pid) break;
+      cur = byId.get(pid);
+    }
+    const mainPathIds = new Set(mainPath.map((e) => e.id as string));
+    const pIdx = mainPath.findIndex((e) => e.id === parentId);
+    if (pIdx === -1) {
+      ctx.ui.notify("Parent node is not on the current path.", "warning");
+      return;
+    }
+
+    // Collect a node's non-main-path subtree, flattened in order.
+    const collectSubtree = (
+      rootId: string,
+      includeRoot: boolean,
+    ): Array<Record<string, unknown>> => {
+      const result: Array<Record<string, unknown>> = [];
+      const walk = (id: string, first: boolean) => {
+        const node = byId.get(id);
+        if (!node) return;
+        if (!first || includeRoot) result.push(node);
+        for (const child of allEntries.filter(
+          (e) =>
+            (e.parentId as string | null) === id &&
+            !mainPathIds.has(e.id as string),
+        )) {
+          walk(child.id as string, false);
+        }
+      };
+      walk(rootId, true);
+      return result;
+    };
+
+    // Rebuild segments.
+    const segmentA = mainPath.slice(0, pIdx + 1); // root → parent (inclusive)
+    const srcOnMain = mainPathIds.has(srcId);
+    // The main-path continuation after the parent (skipping src itself when
+    // the summary sits on the main path).
+    const mainAfterParent = srcOnMain
+      ? mainPath.slice(pIdx + 2)
+      : mainPath.slice(pIdx + 1);
+    // The summary's own subtree (branch content after it, off the main path).
+    const srcDescendants = srcOnMain ? [] : collectSubtree(srcId, false);
+    // The parent's other side branches — re-attached under the summary.
+    const sideRoots = parentChildren.filter(
+      (e) => e.id !== srcId && !mainPathIds.has(e.id as string),
+    );
+
+    // Old session handling — same two-step as delete.
+    const markChoice = await ctx.ui.select("Delete method", [
+      "New session (keep old as distilled)",
+      "In place (no trace)",
+      "Cancel",
+    ]);
+    if (markChoice === undefined || markChoice === "Cancel") return;
+    const markOld = markChoice === "New session (keep old as distilled)";
+
+    // Rebuild: root → parent, then the summary as the parent's single child,
+    // with every other branch of the parent re-attached under the summary.
+    const oldSessionFile = sm.getSessionFile();
+    const oldTitle = sm.getSessionName();
+    const sessionDir = sm.getSessionDir();
+    const cwd = ctx.cwd;
+
+    await ctx.newSession({
+      setup: (sm2) => {
+        for (const entry of segmentA) {
+          appendEntry(sm2, entry);
+        }
+        const srcNewId = appendEntry(sm2, srcEntry);
+
+        // The summary's own continuation (branch content after it).
+        for (const entry of srcDescendants) {
+          appendEntry(sm2, entry);
+        }
+
+        // The parent's other side branches, re-attached under the summary.
+        for (const root of sideRoots) {
+          sm2.branch(srcNewId);
+          for (const entry of collectSubtree(root.id as string, true)) {
+            appendEntry(sm2, entry);
+          }
+        }
+
+        // The main-path continuation, re-attached under the summary.
+        sm2.branch(srcNewId);
+        for (const entry of mainAfterParent) {
+          appendEntry(sm2, entry);
+        }
+      },
+      withSession: async (freshCtx) => {
+        const newSessionFile = freshCtx.sessionManager.getSessionFile();
+        if (oldSessionFile && newSessionFile && markOld) {
+          if (config.autoClean) {
+            deleteSession(oldSessionFile);
+          } else {
+            await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
+            setParentSession(oldSessionFile, newSessionFile);
+            markDistilledTitle(oldSessionFile, oldTitle);
+          }
+        }
+        freshCtx.ui.notify(
+          "Merged branch summary into main path",
+          "success",
+        );
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    ctx.ui.notify(`Merge failed: ${message}`, "error");
+  }
+}
+
 /** Path of a freshly forked session awaiting its first new user message. */
 let pendingForkSession: string | undefined;
 
