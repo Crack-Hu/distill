@@ -30,7 +30,7 @@ pi install https://github.com/Crack-Hu/distill
 ```
 1. /tree 浏览会话树 → shift+L 给关键节点打标签
 2. /distill <label> [补充说明]          压缩标签 → 当前位置
-   /distill <label1> <label2> [补充]    压缩两个标签之间的中间段
+   同名标签标两处 → /distill <label> → 选 "Between the two tags"
 3. 生成摘要 → 确认或编辑 → 回车执行
 ```
 
@@ -40,7 +40,7 @@ pi install https://github.com/Crack-Hu/distill
 /tree → 浏览到关键节点 → shift+L → 输入标签名 → 回车
 ```
 
-标签是 pi 原生的（黄色节点）。同名标签可以在树中标记多处，用于压缩中间段。
+标签是 pi 原生的（黄色节点）。同名标签可以在树中标记多处；**压缩两个位置之间的内容时，给两端标同一个标签名即可**（只有单标签一种调用格式）。
 
 ---
 
@@ -48,8 +48,7 @@ pi install https://github.com/Crack-Hu/distill
 
 | 命令 | 说明 |
 |------|------|
-| `/distill <label> [补充]` | 压缩从标签到当前位置的内容 |
-| `/distill <label1> <label2> [补充]` | 压缩两个标签之间的内容 |
+| `/distill <label> [补充]` | 压缩从标签到当前位置的内容；同名标签标两处时可选压缩两处之间 |
 | `/distill del <label>` | 删除范围（不生成摘要）；单独 `/distill del` 操作标签 `del` |
 | `/distill merge <label>` | 收拢分支摘要（父节点下多分支时）；单独 `/distill merge` 操作标签 `merge` |
 | `/distill context on\|off` | 摘要生成时是否携带完整上文背景 |
@@ -69,7 +68,6 @@ pi install https://github.com/Crack-Hu/distill
   - `Up to the first tag` — 压缩到第一个
   - `Up to the last tag` — 压缩到最后一个
 - **多于 2 个**：弹窗列出每个标签（带位置描述，如 `#1 user: "说234"`），选择压缩到哪一个
-- **`/distill tag tag`（同名双标签）**：恰好 2 个候选时直接压缩两个标签之间，免弹窗
 
 标签解析使用 pi 的标准 `getLabel`（`labelsById`），遵循后写覆盖语义——空标签清除、重复标记去重，与 `/tree` 显示完全一致。
 

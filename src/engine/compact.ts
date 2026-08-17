@@ -47,12 +47,12 @@ function logPrompt(prompt: string, modelLabel: string): void {
 
 export interface CompactRange {
   startLabel: string;
-  /** If set, end at this label; otherwise end at current leaf. */
-  endLabel?: string;
   /** Pre-resolved start entry ID (skips label lookup). */
   startId?: string;
   /** Pre-resolved end entry ID (skips label lookup). */
   endId?: string;
+  /** Human-readable description of the end point (for error messages). */
+  endLabelDesc?: string;
   supplement?: string;
 }
 
@@ -319,19 +319,12 @@ export async function executeCompact(
     throw new Error(`Label "${range.startLabel}" not found. Create one via /tree → shift+L first.`);
   }
 
-  // Resolve end: pre-resolved ID, endLabel, or current leaf
+  // Resolve end: pre-resolved ID, or current leaf
   let endId: string;
   let endLabelDesc: string;
   if (range.endId) {
     endId = range.endId;
-    endLabelDesc = range.endLabel ?? "current position";
-  } else if (range.endLabel) {
-    const resolved = resolveLabel(sm, allEntries, range.endLabel);
-    if (!resolved) {
-      throw new Error(`Label "${range.endLabel}" not found.`);
-    }
-    endId = resolved;
-    endLabelDesc = range.endLabel;
+    endLabelDesc = range.endLabelDesc ?? "current position";
   } else {
     endId = sm.getLeafId();
     if (!endId) throw new Error("Cannot determine current leaf node.");

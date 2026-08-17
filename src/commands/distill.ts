@@ -403,19 +403,18 @@ async function pickLabelCandidate(
 }
 
 /**
- * Resolve a label pair to concrete entry IDs, prompting the user when a
- * label appears multiple times in the tree.
+ * Resolve a label to concrete entry IDs, prompting the user when it appears
+ * multiple times in the tree. Only the single-label form exists — a pair is
+ * expressed by tagging both spots with the same name.
  *
- * Single label (`/distill tag`):
  *   1 match   → tag → current position
  *   2 matches → ask: between the two / up to the first / up to the last
  *   >2 matches→ ask which tag to compress up to
  *
- * Two labels (`/distill tag1 tag2`): each ambiguous label prompts a picker.
  * Returns null when the user cancels.
  */
 async function resolveRange(
-  args: { startLabel: string; endLabel?: string },
+  args: { startLabel: string },
   ctx: ExtensionCommandContext,
 ): Promise<{ startId: string; endId: string; pair: boolean } | null> {
   const allEntries = ctx.sessionManager.getEntries() as Array<
@@ -434,65 +433,6 @@ async function resolveRange(
 
   const leafId = ctx.sessionManager.getLeafId();
   if (!leafId) throw new Error("Cannot determine current leaf node.");
-
-  // Two-label form.
-  if (args.endLabel) {
-    // Same-name pair (`/distill tag tag`): the intent is "between the two
-    // tags". With exactly two occurrences, compress between them directly.
-    if (args.endLabel === args.startLabel) {
-      if (startCandidates.length === 2) {
-        return {
-          startId: startCandidates[0],
-          endId: startCandidates[1],
-          pair: true,
-        };
-      }
-      const startId = await pickLabelCandidate(
-        startCandidates,
-        args.startLabel,
-        "start",
-        ctx,
-      );
-      if (!startId) return null;
-      const rest = startCandidates.filter((id) => id !== startId);
-      if (rest.length === 0) return null;
-      if (rest.length === 1) return { startId, endId: rest[0], pair: true };
-      const endId = await pickLabelCandidate(
-        rest,
-        args.startLabel,
-        "end",
-        ctx,
-      );
-      if (!endId) return null;
-      return { startId, endId, pair: true };
-    }
-
-    const endCandidates = resolveAllLabels(
-      ctx.sessionManager,
-      allEntries,
-      args.endLabel,
-    );
-    if (endCandidates.length === 0) {
-      throw new Error(
-        `Label "${args.endLabel}" not found. Create one via /tree → shift+L first.`,
-      );
-    }
-    const startId = await pickLabelCandidate(
-      startCandidates,
-      args.startLabel,
-      "start",
-      ctx,
-    );
-    if (!startId) return null;
-    const endId = await pickLabelCandidate(
-      endCandidates,
-      args.endLabel,
-      "end",
-      ctx,
-    );
-    if (!endId) return null;
-    return { startId, endId, pair: true };
-  }
 
   // Single-label form.
   if (startCandidates.length === 1) {
@@ -952,7 +892,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
 
   pi.registerCommand("distill", {
     description:
-      "Context distill: /distill <label> [supplement] or /distill <label1> <label2> [supplement]; /distill del [<label>] deletes a range; /distill merge [<label>] folds sibling branches under a branch summary",
+      "Context distill: /distill <label> [supplement] (tag both ends of a range with the same name); /distill del [<label>] deletes a range; /distill merge [<label>] folds sibling branches under a branch summary",
     getArgumentCompletions: (argumentPrefix) => {
       const prefix = argumentPrefix.trim().toLowerCase();
       if (!prefix) return subcommandCompletions;
@@ -1062,7 +1002,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
 
       if (parts.labels.length === 0) {
         ctx.ui.notify(
-          "Usage: /distill <label> [supplement]  or  /distill <label1> <label2> [supplement]\n" +
+          "Usage: /distill <label> [supplement]  (tag both ends of a range with the same name)\n" +
             "  /distill del <label>  deletes the range without summarizing\n" +
             "Sub-commands: context on|off  /  auto-clean on|off  /  model  /  clean",
           "warning",
@@ -1073,22 +1013,18 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
       try {
         // Resolve labels to concrete entry IDs — duplicate tags prompt the
         // user to disambiguate before any work happens.
-        const range = await resolveRange(
-          {
-            startLabel: parts.labels[0],
-            endLabel: parts.labels.length > 1 ? parts.labels[1] : undefined,
-          },
-          ctx,
-        );
+        const range = await resolveRange({ startLabel: parts.labels[0] }, ctx);
         if (!range) return; // user cancelled
 
         // Run compact engine
         const result = await executeCompact(
           {
             startLabel: parts.labels[0],
-            endLabel: parts.labels.length > 1 ? parts.labels[1] : undefined,
             startId: range.startId,
             endId: range.endId,
+            // Describe the end point for error messages: a paired range
+            // ("Between the two tags") ends at the second tag, not the leaf.
+            endLabelDesc: range.pair ? "the second tag" : undefined,
             supplement: parts.supplement,
           },
           config,
@@ -1135,8 +1071,6 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
               }),
               range: {
                 startLabel: parts.labels[0],
-                endLabel:
-                  parts.labels.length > 1 ? parts.labels[1] : undefined,
               },
               turnCount: result.turnCount,
               timestamp: Date.now(),
@@ -1361,18 +1295,12 @@ function parseArgs(raw: string): ParsedArgs {
 
   if (tokens.length === 0) return { labels: [], supplement: undefined };
 
-  // First one or two tokens are labels, rest is supplement
-  const labels: string[] = [tokens[0]];
-
-  // Check if token[1] looks like a label (word-like identifier)
-  if (tokens.length >= 2 && /^[\w\-_\u4e00-\u9fff]+$/.test(tokens[1])) {
-    labels.push(tokens[1]);
-    const rest = tokens.slice(2).join(" ");
-    return { labels, supplement: rest || undefined };
-  }
-
-  const rest = tokens.slice(1).join(" ");
-  return { labels, supplement: rest || undefined };
+  // Only the single-label form exists — pairs are expressed by tagging both
+  // spots with the same name, so every remaining token is supplement text.
+  return {
+    labels: [tokens[0]],
+    supplement: tokens.slice(1).join(" ") || undefined,
+  };
 }
 
 /** Split a string into tokens, honoring double/single quotes and backslash escapes. */
