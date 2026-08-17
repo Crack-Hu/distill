@@ -12,7 +12,7 @@ import {
   type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 
-import { collectBranches, executeCompact } from "../engine/compact";
+import { executeCompact } from "../engine/compact";
 import type { DistillConfig } from "../engine/compact";
 import { groupPathIntoTurns, resolveAllLabels } from "../engine/turn-group";
 import { deleteSession, setParentSession } from "../engine/session-io";
@@ -215,7 +215,10 @@ function isDistilledSession(sessionFile: string): boolean {
 
 /** Delete the range as a new session, marking the old one as distilled. */
 async function deleteAsNewSession(
-  result: Awaited<ReturnType<typeof executeCompact>>,
+  result: Awaited<ReturnType<typeof executeCompact>> & {
+    /** Whole-tree rebuild plan (point delete of a turn anywhere in the tree). */
+    plan?: Array<{ entry: Record<string, unknown>; parentId: string | null }>;
+  },
   ctx: ExtensionCommandContext,
   config: DistillConfig,
   markOld: boolean,
@@ -229,6 +232,22 @@ async function deleteAsNewSession(
     setup: (sm) => {
       const idMap = new Map<string, string>();
       let anchorNewId: string | undefined;
+
+      // Whole-tree rebuild: copy every entry in DFS order except the deleted
+      // turn; each entry is appended under its (remapped) parent. The deleted
+      // turn's children already point at the deleted turn's parent.
+      if (result.plan) {
+        for (const { entry, parentId } of result.plan) {
+          if (parentId) {
+            const parentNewId = idMap.get(parentId);
+            if (!parentNewId) continue;
+            sm.branch(parentNewId);
+          }
+          const newId = appendEntry(sm, entry);
+          if (newId) idMap.set(entry.id as string, newId);
+        }
+        return;
+      }
 
       for (const entry of result.segmentA) {
         const newId = appendEntry(sm, entry);
@@ -545,30 +564,35 @@ async function deleteSingleEntry(
   const sm = ctx.sessionManager;
   const allEntries = sm.getEntries() as Array<Record<string, unknown>>;
   const byId = new Map(allEntries.map((e) => [e.id as string, e]));
-  const leafId = sm.getLeafId();
-  if (!leafId) throw new Error("Cannot determine current leaf node.");
 
-  // Full root → leaf path
-  const fullPath: Array<Record<string, unknown>> = [];
-  let cur = byId.get(leafId);
+  // Path root → target (following parentId chain). No restriction to the
+  // current path: a point delete removes exactly the tagged turn wherever it
+  // sits in the tree — it never spans branches, so branch topology needs no
+  // probing.
+  const targetPath: Array<Record<string, unknown>> = [];
+  let cur = byId.get(targetId);
   const seen = new Set<string>();
   while (cur && !seen.has(cur.id as string)) {
     seen.add(cur.id as string);
-    fullPath.unshift(cur);
+    targetPath.unshift(cur);
     const pid = cur.parentId as string | null;
     if (!pid) break;
     cur = byId.get(pid);
   }
+  const target = targetPath[targetPath.length - 1];
+  if (!target || (target.id as string) !== targetId) {
+    throw new Error("Target entry not found.");
+  }
 
-  // Turn logic: the deleted range is the turn containing the summary. Since a
-  // distilled summary is its own turn, this removes exactly the summary while
-  // keeping the surrounding question → answer turns intact.
-  const turns = groupPathIntoTurns(fullPath);
+  // Turn logic: the deleted unit is the turn containing the tag. A distilled
+  // summary is its own turn, so this removes exactly the summary; a
+  // user/assistant message removes its whole question → answer turn.
+  const turns = groupPathIntoTurns(targetPath);
   const turnIdx = turns.findIndex((t) =>
     t.entries.some((e) => e.id === targetId),
   );
   if (turnIdx === -1) {
-    throw new Error("Target entry is not on the current path.");
+    throw new Error("Target entry not found.");
   }
   if (turnIdx === 0) {
     throw new Error(
@@ -577,31 +601,77 @@ async function deleteSingleEntry(
   }
   const targetTurn = turns[turnIdx];
 
-  // Branches forking off the kept part are preserved. If the deleted summary
-  // is a fork point, its branches are re-attached to the last kept entry.
-  const lastKept = turns[turnIdx - 1].entries[
-    turns[turnIdx - 1].entries.length - 1
-  ];
-  const parentId = lastKept?.id as string | undefined;
-  const turnEndId = targetTurn.entries[
-    targetTurn.entries.length - 1
-  ].id as string;
-  const branches = collectBranches(allEntries, byId, fullPath, turnEndId).map(
-    (b) =>
-      b.branchPointId === targetId && parentId
-        ? { ...b, branchPointId: parentId }
-        : b,
-  );
+  // Whole-tree rebuild plan: copy every entry in DFS order except the deleted
+  // turn; the deleted turn's descendants are re-attached to the turn's parent.
+  // All other branches keep their original topology.
+  const childrenOf = new Map<string | null, Array<Record<string, unknown>>>();
+  for (const e of allEntries) {
+    const pid = (e.parentId as string | null) ?? null;
+    const list = childrenOf.get(pid);
+    if (list) list.push(e);
+    else childrenOf.set(pid, [e]);
+  }
 
-  const result: Awaited<ReturnType<typeof executeCompact>> = {
-    summary: "",
-    segmentA: turns.slice(0, turnIdx).flatMap((t) => t.entries),
-    segmentBC: targetTurn.entries.filter((e) => e.type === "message"),
-    segmentD: turns.slice(turnIdx + 1).flatMap((t) => t.entries),
-    turnCount: 1,
-    branches,
+  // The turn on the parent chain ends at the tagged node, but the reply chain
+  // hanging off it (assistant/tool/label nodes) is part of the same turn and
+  // must go too. A user (or compactionSummary) child starts a new turn and is
+  // preserved — it gets re-attached to the deleted turn's parent.
+  const skipIds = new Set(targetTurn.entries.map((e) => e.id as string));
+  const pending = [...targetTurn.entries];
+  while (pending.length > 0) {
+    const e = pending.pop()!;
+    for (const child of childrenOf.get(e.id as string) ?? []) {
+      const role = (child as { message?: { role?: string } }).message?.role;
+      const isTurnStart =
+        child.type === "message" &&
+        (role === "user" || role === "compactionSummary");
+      if (!isTurnStart && !skipIds.has(child.id as string)) {
+        skipIds.add(child.id as string);
+        pending.push(child);
+      }
+    }
+  }
+  const plan: Array<{
+    entry: Record<string, unknown>;
+    parentId: string | null;
+  }> = [];
+  const walk = (
+    entry: Record<string, unknown>,
+    effectiveParentId: string | null,
+  ) => {
+    if (skipIds.has(entry.id as string)) {
+      for (const c of childrenOf.get(entry.id as string) ?? []) {
+        walk(c, effectiveParentId);
+      }
+      return;
+    }
+    plan.push({ entry, parentId: effectiveParentId });
+    for (const c of childrenOf.get(entry.id as string) ?? []) {
+      walk(c, entry.id as string);
+    }
   };
-  await deleteAsNewSession(result, ctx, config, markOld);
+  for (const root of childrenOf.get(null) ?? []) {
+    if (root.type === "session") continue;
+    walk(root, null);
+  }
+  if (plan.length === 0) {
+    throw new Error("Nothing to rebuild.");
+  }
+
+  await deleteAsNewSession(
+    {
+      summary: "",
+      segmentA: [],
+      segmentBC: targetTurn.entries.filter((e) => e.type === "message"),
+      segmentD: [],
+      turnCount: 1,
+      branches: [],
+      plan,
+    },
+    ctx,
+    config,
+    markOld,
+  );
 }
 
 /**
@@ -635,8 +705,10 @@ async function handleDelete(
     // question → answer turn.
     let single = false;
     if (!range.pair) {
+      // Only reached when exactly one tag with this name exists (a single
+      // occurrence resolves straight to "tag → current position").
       const how = await ctx.ui.select(
-        `Label "${label}" found — delete how?`,
+        `Label "${label}" occurs once — delete how?`,
         ["This turn only", "Label to current position", "Cancel"],
       );
       if (how === undefined || how === "Cancel") return;
