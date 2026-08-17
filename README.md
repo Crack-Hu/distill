@@ -2,6 +2,27 @@
 
 Distill 是一个 pi 编码助手的上下文压缩扩展。你可以用 pi 原生的 `/tree` + `shift+L` 打标签，然后通过 `/distill` 命令把选定的对话范围压缩成 AI 摘要并重建会话，大幅减少上下文长度，同时保留关键信息。
 
+零依赖，仅使用 pi 原生 API。
+
+---
+
+## 安装
+
+从 GitHub 安装：
+
+```bash
+pi install git:github.com/Crack-Hu/distill@main
+```
+
+或使用 https 地址（不依赖 git 协议）：
+
+```bash
+pi install https://github.com/Crack-Hu/distill
+```
+
+> 扩展零依赖，安装后即可使用，无需 `npm install`。
+> 本地开发可用 `pi -e ./distill/index.ts` 直接加载。
+
 ---
 
 ## 工作流程
