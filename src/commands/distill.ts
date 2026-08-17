@@ -395,7 +395,7 @@ async function pickLabelCandidate(
 async function resolveRange(
   args: { startLabel: string; endLabel?: string },
   ctx: ExtensionCommandContext,
-): Promise<{ startId: string; endId: string } | null> {
+): Promise<{ startId: string; endId: string; pair: boolean } | null> {
   const allEntries = ctx.sessionManager.getEntries() as Array<
     Record<string, unknown>
   >;
@@ -419,7 +419,11 @@ async function resolveRange(
     // tags". With exactly two occurrences, compress between them directly.
     if (args.endLabel === args.startLabel) {
       if (startCandidates.length === 2) {
-        return { startId: startCandidates[0], endId: startCandidates[1] };
+        return {
+          startId: startCandidates[0],
+          endId: startCandidates[1],
+          pair: true,
+        };
       }
       const startId = await pickLabelCandidate(
         startCandidates,
@@ -430,7 +434,7 @@ async function resolveRange(
       if (!startId) return null;
       const rest = startCandidates.filter((id) => id !== startId);
       if (rest.length === 0) return null;
-      if (rest.length === 1) return { startId, endId: rest[0] };
+      if (rest.length === 1) return { startId, endId: rest[0], pair: true };
       const endId = await pickLabelCandidate(
         rest,
         args.startLabel,
@@ -438,7 +442,7 @@ async function resolveRange(
         ctx,
       );
       if (!endId) return null;
-      return { startId, endId };
+      return { startId, endId, pair: true };
     }
 
     const endCandidates = resolveAllLabels(
@@ -465,12 +469,12 @@ async function resolveRange(
       ctx,
     );
     if (!endId) return null;
-    return { startId, endId };
+    return { startId, endId, pair: true };
   }
 
   // Single-label form.
   if (startCandidates.length === 1) {
-    return { startId: startCandidates[0], endId: leafId };
+    return { startId: startCandidates[0], endId: leafId, pair: false };
   }
 
   if (startCandidates.length === 2) {
@@ -480,9 +484,11 @@ async function resolveRange(
       ["Between the two tags", "Up to the first tag", "Up to the last tag"],
     );
     if (choice === undefined) return null;
-    if (choice === "Between the two tags") return { startId: first, endId: last };
-    if (choice === "Up to the first tag") return { startId: first, endId: leafId };
-    return { startId: last, endId: leafId };
+    if (choice === "Between the two tags")
+      return { startId: first, endId: last, pair: true };
+    if (choice === "Up to the first tag")
+      return { startId: first, endId: leafId, pair: false };
+    return { startId: last, endId: leafId, pair: false };
   }
 
   // More than two matches: pick which tag to compress up to.
@@ -493,7 +499,7 @@ async function resolveRange(
     ctx,
   );
   if (!startId) return null;
-  return { startId, endId: leafId };
+  return { startId, endId: leafId, pair: false };
 }
 
 /** Rough token estimate for a range of entries (chars / 4). */
@@ -619,18 +625,23 @@ async function handleDelete(
     const range = await resolveRange({ startLabel: label }, ctx);
     if (!range) return; // user cancelled
 
-    // Step 1 — deletion granularity. The tagged entry's own turn can be
-    // deleted alone ("This turn only"), or everything from the label up to
-    // the current position can be deleted. Both follow turn semantics: a
-    // distilled summary is its own turn, so deleting it deletes exactly the
-    // summary; a user/assistant message deletes its whole question → answer
-    // turn.
-    const how = await ctx.ui.select(
-      `Label "${label}" points to a single entry — delete how?`,
-      ["This turn only", "Label to current position", "Cancel"],
-    );
-    if (how === undefined || how === "Cancel") return;
-    const single = how === "This turn only";
+    // Step 1 — deletion granularity (single-label ranges only). When the
+    // range is "between two tags" there is no granularity choice: everything
+    // between the tags is deleted. For a single tag, the tagged entry's own
+    // turn can be deleted alone ("This turn only"), or everything from the
+    // label up to the current position can be deleted. Both follow turn
+    // semantics: a distilled summary is its own turn, so deleting it deletes
+    // exactly the summary; a user/assistant message deletes its whole
+    // question → answer turn.
+    let single = false;
+    if (!range.pair) {
+      const how = await ctx.ui.select(
+        `Label "${label}" found — delete how?`,
+        ["This turn only", "Label to current position", "Cancel"],
+      );
+      if (how === undefined || how === "Cancel") return;
+      single = how === "This turn only";
+    }
 
     // Step 2 — old session handling (both granularities share this).
     const markChoice = await ctx.ui.select("Delete method", [
