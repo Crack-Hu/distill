@@ -307,16 +307,17 @@ function describeTagPosition(
     const byId = new Map(allEntries.map((e) => [e.id as string, e]));
 
     // The tagged node itself — most informative when it is a message.
+    // Shown in parentheses as the first line of its content, truncated.
     const node = byId.get(targetId);
     if (node && node.type === "message") {
       const role = (node as { message?: { role?: string } }).message?.role;
       const text = textFromMessage(
         (node as { message: { content: unknown } }).message?.content,
       )
-        .trim()
-        .replace(/\s+/g, " ");
-      if (text) return `${role ?? "msg"}: \"${truncate(text, 30)}\"`;
-      return role ?? "msg";
+        .split("\n")[0]
+        .trim();
+      if (text) return `(${role ?? "msg"}: ${truncate(text, 30)})`;
+      return `(${role ?? "msg"})`;
     }
 
     // Non-message target: locate it on the root → leaf path and show the
@@ -344,9 +345,9 @@ function describeTagPosition(
           const text = textFromMessage(
             (e as { message: { content: unknown } }).message.content,
           )
-            .trim()
-            .replace(/\s+/g, " ");
-          if (text) return `after \"${truncate(text, 30)}\"`;
+            .split("\n")[0]
+            .trim();
+          if (text) return `(after \"${truncate(text, 30)}\")`;
         }
       }
     }
@@ -619,13 +620,14 @@ async function handleDelete(
     if (!range) return; // user cancelled
 
     // Step 1 — deletion granularity. The tagged entry's own turn can be
-    // deleted alone ("This turn only"), or the whole range up to the current
-    // position can be deleted. Both follow turn semantics: a distilled
-    // summary is its own turn, so deleting it deletes exactly the summary;
-    // a user/assistant message deletes its whole question → answer turn.
+    // deleted alone ("This turn only"), or everything from the label up to
+    // the current position can be deleted. Both follow turn semantics: a
+    // distilled summary is its own turn, so deleting it deletes exactly the
+    // summary; a user/assistant message deletes its whole question → answer
+    // turn.
     const how = await ctx.ui.select(
       `Label "${label}" points to a single entry — delete how?`,
-      ["This turn only", "The whole range", "Cancel"],
+      ["This turn only", "Label to current position", "Cancel"],
     );
     if (how === undefined || how === "Cancel") return;
     const single = how === "This turn only";
@@ -689,7 +691,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
 
   pi.registerCommand("distill", {
     description:
-      "Context distill: /distill <label> [supplement] or /distill <label1> <label2> [supplement]; /distill del <label> deletes a range",
+      "Context distill: /distill <label> [supplement] or /distill <label1> <label2> [supplement]; /distill del [<label>] deletes a range; /distill merge [<label>] folds sibling branches under a branch summary",
     getArgumentCompletions: (argumentPrefix) => {
       const prefix = argumentPrefix.trim().toLowerCase();
       if (!prefix) return subcommandCompletions;
@@ -780,6 +782,16 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
       if (delMatch) {
         const label = delMatch[1]?.trim() ?? "del";
         await handleDelete(label, ctx, config);
+        return;
+      }
+
+      // /distill merge [<label>] — merge a side branch's distilled summary
+      // into the main path. With no explicit label, "merge" itself is the
+      // label (a tag named "merge" on a branch summary is merged directly).
+      const mergeMatch = /^merge(?:\s+(.+))?$/i.exec(trimmed);
+      if (mergeMatch) {
+        const label = mergeMatch[1]?.trim() ?? "merge";
+        await handleMerge(label, ctx, config);
         return;
       }
 
