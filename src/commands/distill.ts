@@ -441,15 +441,23 @@ async function resolveRange(
 
   if (startCandidates.length === 2) {
     const [first, last] = startCandidates;
+    // Grey hint with the first line of each tag's message, so "first" and
+    // "last" are unambiguous.
+    const hint = (id: string) =>
+      ctx.ui.theme.fg("dim", describeTagPosition(id, ctx));
+    const options = [
+      "Between the two tags",
+      `Up to the first tag ${hint(first)}`.trimEnd(),
+      `Up to the last tag ${hint(last)}`.trimEnd(),
+    ];
     const choice = await ctx.ui.select(
       `Label "${args.startLabel}" appears twice — compress what?`,
-      ["Between the two tags", "Up to the first tag", "Up to the last tag"],
+      options,
     );
     if (choice === undefined) return null;
-    if (choice === "Between the two tags")
-      return { startId: first, endId: last, pair: true };
-    if (choice === "Up to the first tag")
-      return { startId: first, endId: leafId, pair: false };
+    const idx = options.indexOf(choice);
+    if (idx === 0) return { startId: first, endId: last, pair: true };
+    if (idx === 1) return { startId: first, endId: leafId, pair: false };
     return { startId: last, endId: leafId, pair: false };
   }
 
