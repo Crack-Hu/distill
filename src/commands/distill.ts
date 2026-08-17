@@ -390,8 +390,11 @@ async function pickLabelCandidate(
   ctx: ExtensionCommandContext,
 ): Promise<string | null> {
   if (candidates.length === 1) return candidates[0];
+  // Dim grey hint with the tagged message's first line, matching the
+  // two-candidate picker style: plain index + grey description.
   const options = candidates.map(
-    (id, i) => `#${i + 1} ${describeTagPosition(id, ctx)}`.trim(),
+    (id, i) =>
+      `#${i + 1} ${ctx.ui.theme.fg("dim", describeTagPosition(id, ctx))}`.trim(),
   );
   const chosen = await ctx.ui.select(
     `Label "${labelName}" appears ${candidates.length} times — pick the ${role} tag`,
