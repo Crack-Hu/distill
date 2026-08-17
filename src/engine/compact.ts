@@ -274,6 +274,22 @@ interface CompactResult {
   turnCount: number;
   /** Branches that fork off the main path before endId. */
   branches: BranchData[];
+  /**
+   * Whole-tree rebuild plan (side-branch ranges). When set, segmentA/D and
+   * branches are empty — the plan carries the full DFS order plus the parent
+   * each entry is re-attached under. `insertSummary` marks the slot where a
+   * fresh compactionSummary is inserted instead of copying the entry.
+   */
+  plan?: PlanEntry[];
+}
+
+export interface PlanEntry {
+  /** Entry to copy, or the placeholder when insertSummary is set. */
+  entry: AnyEntry;
+  /** Effective parent after remapping; "__summary__" = under the new summary. */
+  parentId: string | null;
+  /** Insert a fresh compactionSummary here instead of copying the entry. */
+  insertSummary?: boolean;
 }
 
 /**
@@ -331,90 +347,218 @@ export async function executeCompact(
   }
 
   // Build the FULL path from root → current leaf.
-  // We need entries before startId (segmentA) and after endId (segmentD).
   const leafId = sm.getLeafId();
   const fullPath = buildFullPath(byId, leafId);
-
-  // Branch check — reject if branches inside compressed range. Children that
-  // continue the main path (root → leaf) past endId are segmentD, not forks.
   const fullPathIds = new Set(fullPath.map((e) => e.id as string));
-  if (hasBranchInRange(allEntries, byId, startId, endId, fullPathIds)) {
-    throw new Error(
-      "Branch detected in range — not supported yet. Distill before/after the branch point separately.",
-    );
-  }
 
-  // Snap startId/endId to nearest message entries on the FULL path.
-  function snapToMessage(target: string, direction: "forward" | "backward"): string {
-    const idx = fullPath.findIndex((e) => (e.id as string) === target);
+  // Snap an id to the nearest message entry on a given path.
+  function snapToMessageOn(
+    path: Array<Record<string, unknown>>,
+    target: string,
+    direction: "forward" | "backward",
+  ): string {
+    const idx = path.findIndex((e) => (e.id as string) === target);
     if (idx === -1) return target;
-    if ((fullPath[idx].type as string) === "message") return target;
+    if ((path[idx].type as string) === "message") return target;
 
     if (direction === "forward") {
-      for (let i = idx + 1; i < fullPath.length; i++) {
-        if ((fullPath[i].type as string) === "message") return fullPath[i].id as string;
+      for (let i = idx + 1; i < path.length; i++) {
+        if ((path[i].type as string) === "message")
+          return path[i].id as string;
       }
     } else {
       for (let i = idx - 1; i >= 0; i--) {
-        if ((fullPath[i].type as string) === "message") return fullPath[i].id as string;
+        if ((path[i].type as string) === "message")
+          return path[i].id as string;
       }
     }
     return target;
   }
 
-  const effectiveStartId = snapToMessage(startId, "forward");
-  const effectiveEndId = snapToMessage(endId, "backward");
+  let segmentA: AnyEntry[] = [];
+  let segmentBC: AnyEntry[] = [];
+  let segmentD: AnyEntry[] = [];
+  let branches: BranchData[] = [];
+  let turnCount = 0;
+  let plan: PlanEntry[] | undefined;
+  let effectiveStartId = startId;
+  let effectiveEndId = endId;
 
-  // Group the FULL path (all entry types) into turns.
-  // A turn boundary is a user message; non-message entries (labels, model
-  // changes, custom entries) stay attached to their current turn.
-  const turns = groupPathIntoTurns(fullPath);
+  // The range may live on a side branch (neither endpoint on the current
+  // main path). Such a range never crosses branches, so the whole tree is
+  // rebuilt with the range replaced by the summary.
+  const offMainPath = !fullPathIds.has(startId) || !fullPathIds.has(endId);
 
-  // Find the turn containing effectiveStartId
-  const fullStartTurn = turns.findIndex((t) =>
-    t.messages.some((m) => m.id === effectiveStartId),
-  );
-  if (fullStartTurn === -1) {
-    throw new Error(`Label "${range.startLabel}" target is not in the message path.`);
-  }
+  if (offMainPath) {
+    // ---- side-branch range ----
+    const branchPath = buildFullPath(byId, endId);
+    effectiveStartId = snapToMessageOn(branchPath, startId, "forward");
+    effectiveEndId = snapToMessageOn(branchPath, endId, "backward");
 
-  // Find the turn containing effectiveEndId
-  const fullEndTurn = turns.findIndex((t) =>
-    t.messages.some((m) => m.id === effectiveEndId),
-  );
-  if (fullEndTurn === -1) {
-    throw new Error(`End label target is not in the message path.`);
-  }
+    const turns = groupPathIntoTurns(branchPath);
+    const fullStartTurn = turns.findIndex((t) =>
+      t.messages.some((m) => m.id === effectiveStartId),
+    );
+    const fullEndTurn = turns.findIndex((t) =>
+      t.messages.some((m) => m.id === effectiveEndId),
+    );
+    if (fullStartTurn === -1 || fullEndTurn === -1) {
+      throw new Error(
+        `Labels "${range.startLabel}" and "${endLabelDesc}" are not on the same path.`,
+      );
+    }
 
-  // Segments — preserve ALL entry types. Turn boundaries are respected so a
-  // "question → answer" pair is never split: a label placed on an assistant
-  // reply pulls its whole turn (including the leading user message) into the
-  // compressed range.
-  const segmentA: AnyEntry[] = [];
-  for (let i = 0; i < fullStartTurn; i++) {
-    segmentA.push(...turns[i].entries);
-  }
+    const segmentBCTurns = turns.slice(fullStartTurn, fullEndTurn + 1);
+    const bcIds = new Set(
+      segmentBCTurns.flatMap((t) => t.entries.map((e) => e.id as string)),
+    );
+    segmentBC = segmentBCTurns
+      .flatMap((t) => t.entries)
+      .filter((e) => e.type === "message");
+    turnCount = fullEndTurn - fullStartTurn + 1;
 
-  const segmentBCTurns = turns.slice(fullStartTurn, fullEndTurn + 1);
-  // Include messages AND previously distilled summaries, so a second distill
-  // never drops the first one's content. (Distilled summaries are stored as
-  // compactionSummary messages, so plain message entries cover both.)
-  const segmentBC: AnyEntry[] = [];
-  for (const t of segmentBCTurns) {
-    for (const e of t.entries) {
-      if (e.type === "message") {
-        segmentBC.push(e);
+    // Continuation: the unique-child message chain below endId is the
+    // branch's segmentD — it survives, re-attached under the summary.
+    const continuationIds = new Set<string>();
+    let node = byId.get(endId);
+    while (node) {
+      const kids = allEntries.filter(
+        (e) =>
+          (e.parentId as string | null) === node.id && e.type === "message",
+      );
+      if (kids.length !== 1) break;
+      continuationIds.add(kids[0].id as string);
+      node = kids[0];
+    }
+
+    // Branch check — children of range nodes that are neither on the range
+    // chain nor the continuation are real forks; reject (same as main path).
+    const messageEntries = allEntries.filter((e) => e.type === "message");
+    for (const id of bcIds) {
+      const kids = messageEntries.filter(
+        (e) => (e.parentId as string | null) === id,
+      );
+      if (
+        kids.some(
+          (c) =>
+            !bcIds.has(c.id as string) && !continuationIds.has(c.id as string),
+        )
+      ) {
+        throw new Error(
+          "Branch detected in range — not supported yet. Distill before/after the branch point separately.",
+        );
       }
     }
-  }
 
-  const segmentD: AnyEntry[] = [];
-  for (let i = fullEndTurn + 1; i < turns.length; i++) {
-    segmentD.push(...turns[i].entries);
-  }
+    // Whole-tree rebuild plan: every entry in DFS order, the range replaced
+    // by a fresh summary at the range start, the range's descendants
+    // re-attached under it.
+    const childrenOf = new Map<string | null, AnyEntry[]>();
+    for (const e of allEntries) {
+      const pid = (e.parentId as string | null) ?? null;
+      const list = childrenOf.get(pid);
+      if (list) list.push(e);
+      else childrenOf.set(pid, [e]);
+    }
+    plan = [];
+    const SUMMARY_ANCHOR = "__summary__";
+    let inserted = false;
+    const walk = (entry: AnyEntry, effParent: string | null) => {
+      if (bcIds.has(entry.id as string)) {
+        if (!inserted) {
+          inserted = true;
+          plan!.push({
+            entry: {
+              type: "message",
+              id: SUMMARY_ANCHOR,
+              parentId: null,
+              message: {},
+            },
+            parentId: effParent,
+            insertSummary: true,
+          });
+        }
+        for (const c of childrenOf.get(entry.id as string) ?? []) {
+          // Labels targeting compressed nodes are dropped with them.
+          if (c.type === "label") continue;
+          walk(c, SUMMARY_ANCHOR);
+        }
+        return;
+      }
+      plan!.push({ entry, parentId: effParent });
+      for (const c of childrenOf.get(entry.id as string) ?? []) {
+        walk(c, entry.id as string);
+      }
+    };
+    for (const root of childrenOf.get(null) ?? []) {
+      if (root.type === "session") continue;
+      walk(root, null);
+    }
+  } else {
+    // ---- main-path range ----
+    // Branch check — reject if branches inside compressed range. Children
+    // that continue the main path (root → leaf) past endId are segmentD.
+    if (hasBranchInRange(allEntries, byId, startId, endId, fullPathIds)) {
+      throw new Error(
+        "Branch detected in range — not supported yet. Distill before/after the branch point separately.",
+      );
+    }
 
-  // Number of conversation turns inside the compressed range.
-  const turnCount = fullEndTurn - fullStartTurn + 1;
+    effectiveStartId = snapToMessageOn(fullPath, startId, "forward");
+    effectiveEndId = snapToMessageOn(fullPath, endId, "backward");
+
+    // Group the FULL path (all entry types) into turns.
+    const turns = groupPathIntoTurns(fullPath);
+
+    // Find the turn containing effectiveStartId
+    const fullStartTurn = turns.findIndex((t) =>
+      t.messages.some((m) => m.id === effectiveStartId),
+    );
+    if (fullStartTurn === -1) {
+      throw new Error(
+        `Label "${range.startLabel}" target is not in the message path.`,
+      );
+    }
+
+    // Find the turn containing effectiveEndId
+    const fullEndTurn = turns.findIndex((t) =>
+      t.messages.some((m) => m.id === effectiveEndId),
+    );
+    if (fullEndTurn === -1) {
+      throw new Error(`End label target is not in the message path.`);
+    }
+
+    // Segments — preserve ALL entry types. Turn boundaries are respected so
+    // a "question → answer" pair is never split: a label placed on an
+    // assistant reply pulls its whole turn (including the leading user
+    // message) into the compressed range.
+    for (let i = 0; i < fullStartTurn; i++) {
+      segmentA.push(...turns[i].entries);
+    }
+
+    const segmentBCTurns = turns.slice(fullStartTurn, fullEndTurn + 1);
+    // Include messages AND previously distilled summaries, so a second
+    // distill never drops the first one's content. (Distilled summaries are
+    // stored as compactionSummary messages, so plain message entries cover
+    // both.)
+    for (const t of segmentBCTurns) {
+      for (const e of t.entries) {
+        if (e.type === "message") {
+          segmentBC.push(e);
+        }
+      }
+    }
+
+    for (let i = fullEndTurn + 1; i < turns.length; i++) {
+      segmentD.push(...turns[i].entries);
+    }
+
+    // Number of conversation turns inside the compressed range.
+    turnCount = fullEndTurn - fullStartTurn + 1;
+
+    // Collect branches that fork off the main path (preserved in new session)
+    branches = collectBranches(allEntries, byId, fullPath, endId);
+  }
 
   // Get background messages
   const backgroundMessages = getBackgroundMessages(
@@ -423,9 +567,6 @@ export async function executeCompact(
     effectiveEndId,
     config.contextOn,
   );
-
-  // Collect branches that fork off the main path (preserved in new session)
-  const branches = collectBranches(allEntries, byId, fullPath, endId);
 
   // Drop mode: skip summary generation and just report the segments.
   if (config.drop) {
@@ -436,6 +577,7 @@ export async function executeCompact(
       segmentD,
       turnCount,
       branches,
+      plan,
     };
   }
 
@@ -486,5 +628,6 @@ export async function executeCompact(
     segmentD,
     turnCount,
     branches,
+    plan,
   };
 }

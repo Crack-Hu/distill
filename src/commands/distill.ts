@@ -237,7 +237,10 @@ async function deleteAsNewSession(
       // turn; each entry is appended under its (remapped) parent. The deleted
       // turn's children already point at the deleted turn's parent.
       if (result.plan) {
-        for (const { entry, parentId } of result.plan) {
+        for (const { entry, parentId, insertSummary } of result.plan) {
+          // Range-delete (drop) carries the summary slot too — skip it: no
+          // summary is inserted when deleting.
+          if (insertSummary) continue;
           if (parentId) {
             const parentNewId = idMap.get(parentId);
             if (!parentNewId) continue;
@@ -1107,6 +1110,75 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
             const idMap = new Map<string, string>();
             let anchorNewId: string | undefined;
 
+            // Shared archive payload (kept out of the LLM context; used by
+            // the view tool to look up original messages).
+            const archiveData = {
+              conversations: result.segmentBC.map((m) => {
+                if (m.type === "message") {
+                  const msg = (m as { message: { role: string; content: unknown } }).message;
+                  return {
+                    role: msg.role,
+                    content:
+                      typeof msg.content === "string"
+                        ? msg.content
+                        : JSON.stringify(msg.content),
+                  };
+                }
+                const ce = m as { content: unknown };
+                return {
+                  role: "distilled_summary",
+                  content:
+                    typeof ce.content === "string"
+                      ? ce.content
+                      : JSON.stringify(ce.content),
+                };
+              }),
+              range: {
+                startLabel: parts.labels[0],
+                endLabel:
+                  parts.labels.length > 1 ? parts.labels[1] : undefined,
+              },
+              turnCount: result.turnCount,
+              timestamp: Date.now(),
+            };
+
+            // Side-branch range: whole-tree rebuild plan. Every entry is
+            // copied in DFS order under its remapped parent; the range is
+            // replaced by a fresh compactionSummary and the range's
+            // descendants are re-attached under it.
+            if (result.plan) {
+              let summaryNewId: string | undefined;
+              for (const { entry, parentId, insertSummary } of result.plan) {
+                if (parentId) {
+                  const parentNewId =
+                    parentId === "__summary__"
+                      ? summaryNewId
+                      : idMap.get(parentId);
+                  if (!parentNewId) continue;
+                  sm.branch(parentNewId);
+                }
+                let newId: string | undefined;
+                if (insertSummary) {
+                  const summaryContent =
+                    `<distilled-summary turns="${result.turnCount}" messages="${result.segmentBC.length}">\n` +
+                    `${finalSummary}\n` +
+                    `</distilled-summary>`;
+                  newId = sm.appendMessage({
+                    role: "compactionSummary",
+                    summary: summaryContent,
+                    tokensBefore: estimateTokens(result.segmentBC),
+                    timestamp: Date.now(),
+                  });
+                  summaryNewId = newId;
+                } else {
+                  newId = appendEntry(sm, entry);
+                }
+                if (newId) idMap.set(entry.id as string, newId);
+              }
+              sm.appendCustomEntry("distilled-archive", archiveData);
+              return;
+            }
+
             // Copy segment A (all entry types) linearly
             for (const entry of result.segmentA) {
               const newId = appendEntry(sm, entry);
@@ -1153,35 +1225,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
             }
 
             // Insert archive (not in LLM context, for the view tool)
-            sm.appendCustomEntry("distilled-archive", {
-              conversations: result.segmentBC.map((m) => {
-                if (m.type === "message") {
-                  const msg = (m as { message: { role: string; content: unknown } }).message;
-                  return {
-                    role: msg.role,
-                    content:
-                      typeof msg.content === "string"
-                        ? msg.content
-                        : JSON.stringify(msg.content),
-                  };
-                }
-                const ce = m as { content: unknown };
-                return {
-                  role: "distilled_summary",
-                  content:
-                    typeof ce.content === "string"
-                      ? ce.content
-                      : JSON.stringify(ce.content),
-                };
-              }),
-              range: {
-                startLabel: parts.labels[0],
-                endLabel:
-                  parts.labels.length > 1 ? parts.labels[1] : undefined,
-              },
-              turnCount: result.turnCount,
-              timestamp: Date.now(),
-            });
+            sm.appendCustomEntry("distilled-archive", archiveData);
           },
           withSession: async (freshCtx) => {
             // Make every older session a flat sibling under the new root,
