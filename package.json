@@ -1,5 +1,9 @@
 {
   "name": "distill",
   "version": "1.0.0",
-  "description": "Manual context compression extension — distill conversation ranges into summaries and rebuild sessions"
+  "description": "Manual context compression extension — distill conversation ranges into summaries and rebuild sessions",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
 }
