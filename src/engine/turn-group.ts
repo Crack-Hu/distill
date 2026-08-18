@@ -65,11 +65,13 @@ export interface Turn {
 export function filterMessageEntries(
   entries: AnyEntry[],
 ): MessageEntry[] {
-  return entries.filter(
-    (e): e is MessageEntry =>
-      e.type === "message" &&
-      typeof (e as MessageEntry).message?.role === "string",
-  );
+  return entries
+    .filter(
+      (e) =>
+        e.type === "message" &&
+        typeof (e as unknown as MessageEntry).message?.role === "string",
+    )
+    .map((e) => e as unknown as MessageEntry);
 }
 
 /**
@@ -90,7 +92,7 @@ export function groupPathIntoTurns(path: AnyEntry[]): Turn[] {
 
   for (const e of path) {
     if (e.type === "message") {
-      const msg = e as MessageEntry;
+      const msg = e as unknown as MessageEntry;
       const role = msg.message.role;
       if (role === "user" || role === "compactionSummary") {
         if (current) turns.push(current);
@@ -141,7 +143,7 @@ export function groupIntoTurns(messages: MessageEntry[]): MessageEntry[][] {
  */
 export function resolveLabel(
   sm: { getLabel(id: string): string | undefined },
-  allEntries: AnyEntry[],
+  allEntries: Array<Record<string, unknown>>,
   labelName: string,
 ): string | undefined {
   for (const e of allEntries) {
@@ -157,7 +159,7 @@ export function resolveLabel(
  */
 export function resolveAllLabels(
   sm: { getLabel(id: string): string | undefined },
-  allEntries: AnyEntry[],
+  allEntries: Array<Record<string, unknown>>,
   labelName: string,
 ): string[] {
   const result: string[] = [];

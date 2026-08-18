@@ -23,13 +23,17 @@ export function registerViewDistilledTool(pi: ExtensionAPI): void {
 
       // Find all distilled-archive entries
       let archives = entries.filter(
-        (e: Record<string, unknown>) =>
-          e.type === "custom" && (e as { customType?: string }).customType === "distilled-archive",
+        (e) =>
+          e.type === "custom" &&
+          (e as unknown as { customType?: string }).customType ===
+            "distilled-archive",
       );
 
       if (params.range) {
-        archives = archives.filter((a: Record<string, unknown>) => {
-          const data = (a as { data?: { range?: { startLabel?: string } } }).data;
+        archives = archives.filter((a) => {
+          const data = (
+            a as unknown as { data?: { range?: { startLabel?: string } } }
+          ).data;
           return data?.range?.startLabel === params.range;
         });
       }
@@ -42,11 +46,19 @@ export function registerViewDistilledTool(pi: ExtensionAPI): void {
               text: "No distilled conversation archives found.",
             },
           ],
+          details: {},
         };
       }
 
-      const texts = archives.map((a: Record<string, unknown>) => {
-        const data = (a as { data?: { conversations?: Array<{ role: string; content: string }>; range?: { startLabel?: string; endLabel?: string } } }).data;
+      const texts = archives.map((a) => {
+        const data = (
+          a as unknown as {
+            data?: {
+              conversations?: Array<{ role: string; content: string }>;
+              range?: { startLabel?: string; endLabel?: string };
+            };
+          }
+        ).data;
         const header = `## Distilled range: ${data?.range?.startLabel ?? "?"} → ${data?.range?.endLabel ?? "current"}`;
         const body = (data?.conversations ?? [])
           .map((c: { role: string; content: string }) => `[${c.role}]: ${c.content}`)
@@ -61,6 +73,7 @@ export function registerViewDistilledTool(pi: ExtensionAPI): void {
             text: texts.join("\n\n---\n\n"),
           },
         ],
+        details: {},
       };
     },
   });

@@ -90,7 +90,7 @@ export function formatMessages(entries: AnyEntry[]): string {
 
   for (const e of entries) {
     if (e.type === "message") {
-      const m = e as MessageEntry;
+      const m = e as unknown as MessageEntry;
       const role = m.message.role;
       if (role === "user") {
         messages.push({ role: "user", content: extractText(m.message.content) });

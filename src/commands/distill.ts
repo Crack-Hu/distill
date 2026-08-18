@@ -12,9 +12,11 @@ import {
   type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 
-import { executeCompact } from "../engine/compact";
+import { executeCompact, type PlanEntry } from "../engine/compact";
+import { buildRebuildPlan } from "../engine/compact";
 import type { DistillConfig } from "../engine/compact";
 import { groupPathIntoTurns, resolveAllLabels } from "../engine/turn-group";
+import type { AnyEntry } from "../engine/turn-group";
 import { deleteSession, setParentSession } from "../engine/session-io";
 
 // ---- config I/O -----------------------------------------------------------
@@ -64,7 +66,7 @@ async function showSummaryAndConfirm(
  * Copy a single session entry into the new session, preserving its type.
  * Returns the new entry ID (or undefined for skipped entry types).
  */
-function appendEntry(
+export function appendEntry(
   sm: { [k: string]: any },
   entry: Record<string, unknown>,
 ): string | undefined {
@@ -98,13 +100,71 @@ function appendEntry(
       );
     }
     case "session_info": {
-      const e = entry as { name: string };
-      return sm.appendSessionInfo(e.name);
+      const e = entry as { name?: string };
+      // Older session formats may omit the name; an empty name is fine and
+      // simply means "no title".
+      return sm.appendSessionInfo(e.name ?? "");
     }
     // label / compaction / branch_summary reference old entry IDs and are
     // skipped; they don't participate in LLM context.
     default:
       return undefined;
+  }
+}
+
+/**
+ * Rebuild a session from a whole-tree plan (side-branch distill / delete).
+ *
+ * With `summaryContent`, the plan's summary slot is materialized as a fresh
+ * compactionSummary message and the range's descendants are re-attached
+ * under it (distill). With `summaryContent === undefined` (delete mode) the
+ * slot is skipped, but its parent is remembered so the range's descendants —
+ * which the plan re-attaches under the slot — survive under the range's
+ * parent instead of being dropped.
+ */
+export function rebuildPlanEntries(
+  sm: { [k: string]: any },
+  plan: PlanEntry[],
+  summaryContent: string | undefined,
+  tokensBefore: number,
+): void {
+  const idMap = new Map<string, string | null>();
+  let summaryNewId: string | undefined;
+  let summaryParentNewId: string | null | undefined;
+
+  for (const { entry, parentId, insertSummary } of plan) {
+    if (insertSummary) {
+      if (summaryContent === undefined) {
+        // Delete mode: no summary is inserted. Remember where the slot sits
+        // so entries re-attached under it (parentId === "__summary__") land
+        // under the range's parent.
+        summaryParentNewId = parentId ? idMap.get(parentId) ?? null : null;
+        continue;
+      }
+      const parentNewId = parentId ? idMap.get(parentId) ?? null : null;
+      if (parentId && !parentNewId) continue;
+      if (parentNewId) sm.branch(parentNewId);
+      summaryNewId = sm.appendMessage({
+        role: "compactionSummary",
+        summary: summaryContent,
+        tokensBefore,
+        timestamp: Date.now(),
+      });
+      idMap.set(entry.id as string, summaryNewId);
+      continue;
+    }
+
+    const effParent =
+      parentId === "__summary__"
+        ? (summaryNewId ?? summaryParentNewId ?? null)
+        : parentId
+          ? (idMap.get(parentId) ?? null)
+          : null;
+    if (parentId && !effParent) continue;
+    if (effParent) sm.branch(effParent);
+    const newId = appendEntry(sm, entry);
+    if (newId) idMap.set(entry.id as string, newId);
+    else if (effParent) idMap.set(entry.id as string, effParent);
   }
 }
 
@@ -190,7 +250,7 @@ async function resumeDistilledSession(
         if (message) {
           await freshCtx.sendUserMessage(message);
         }
-        freshCtx.ui.notify("Forked from distilled session", "success");
+        freshCtx.ui.notify("Forked from distilled session", "info");
       },
     });
   } catch (err) {
@@ -217,7 +277,7 @@ function isDistilledSession(sessionFile: string): boolean {
 async function deleteAsNewSession(
   result: Awaited<ReturnType<typeof executeCompact>> & {
     /** Whole-tree rebuild plan (point delete of a turn anywhere in the tree). */
-    plan?: Array<{ entry: Record<string, unknown>; parentId: string | null }>;
+    plan?: PlanEntry[];
   },
   ctx: ExtensionCommandContext,
   config: DistillConfig,
@@ -243,7 +303,7 @@ async function deleteAsNewSession(
     // Keep the old session's position unless the old session is kept and
     // re-parented under the new one (new-session mode).
     parentSession: markOld ? undefined : oldParentSession,
-    setup: (sm) => {
+    setup: async (sm) => {
       const idMap = new Map<string, string>();
       let anchorNewId: string | undefined;
 
@@ -251,18 +311,10 @@ async function deleteAsNewSession(
       // turn; each entry is appended under its (remapped) parent. The deleted
       // turn's children already point at the deleted turn's parent.
       if (result.plan) {
-        for (const { entry, parentId, insertSummary } of result.plan) {
-          // Range-delete (drop) carries the summary slot too — skip it: no
-          // summary is inserted when deleting.
-          if (insertSummary) continue;
-          if (parentId) {
-            const parentNewId = idMap.get(parentId);
-            if (!parentNewId) continue;
-            sm.branch(parentNewId);
-          }
-          const newId = appendEntry(sm, entry);
-          if (newId) idMap.set(entry.id as string, newId);
-        }
+        // Range-delete (drop) carries the plan's summary slot for topology;
+        // no summary is inserted and the range's descendants are re-attached
+        // under the slot's parent (rebuildPlanEntries with undefined content).
+        rebuildPlanEntries(sm, result.plan, undefined, 0);
         return;
       }
 
@@ -271,6 +323,10 @@ async function deleteAsNewSession(
         if (newId) {
           idMap.set(entry.id as string, newId);
           anchorNewId = newId;
+        } else if (anchorNewId) {
+          // Pass-through entry (label / compaction / branch_summary): not
+          // copied, but branches forking off it attach under the anchor.
+          idMap.set(entry.id as string, anchorNewId);
         }
       }
 
@@ -322,7 +378,7 @@ async function deleteAsNewSession(
       }
       freshCtx.ui.notify(
         markOld ? "Deleted (new session)" : "Deleted in place",
-        "success",
+        "info",
       );
     },
   });
@@ -357,7 +413,7 @@ function describeTagPosition(
   ctx: ExtensionCommandContext,
 ): string {
   try {
-    const allEntries = ctx.sessionManager.getEntries() as Array<
+    const allEntries = ctx.sessionManager.getEntries() as unknown as Array<
       Record<string, unknown>
     >;
     const byId = new Map(allEntries.map((e) => [e.id as string, e]));
@@ -454,7 +510,7 @@ async function resolveRange(
   args: { startLabel: string },
   ctx: ExtensionCommandContext,
 ): Promise<{ startId: string; endId: string; pair: boolean } | null> {
-  const allEntries = ctx.sessionManager.getEntries() as Array<
+  const allEntries = ctx.sessionManager.getEntries() as unknown as Array<
     Record<string, unknown>
   >;
   const startCandidates = resolveAllLabels(
@@ -550,7 +606,9 @@ async function deleteSingleEntry(
   markOld: boolean,
 ): Promise<void> {
   const sm = ctx.sessionManager;
-  const allEntries = sm.getEntries() as Array<Record<string, unknown>>;
+  const allEntries = sm.getEntries() as unknown as Array<
+    Record<string, unknown>
+  >;
   const byId = new Map(allEntries.map((e) => [e.id as string, e]));
 
   // Path root → target (following parentId chain). No restriction to the
@@ -575,7 +633,7 @@ async function deleteSingleEntry(
   // Turn logic: the deleted unit is the turn containing the tag. A distilled
   // summary is its own turn, so this removes exactly the summary; a
   // user/assistant message removes its whole question → answer turn.
-  const turns = groupPathIntoTurns(targetPath);
+  const turns = groupPathIntoTurns(targetPath as unknown as AnyEntry[]);
   const turnIdx = turns.findIndex((t) =>
     t.entries.some((e) => e.id === targetId),
   );
@@ -591,7 +649,9 @@ async function deleteSingleEntry(
 
   // Whole-tree rebuild plan: copy every entry in DFS order except the deleted
   // turn; the deleted turn's descendants are re-attached to the turn's parent.
-  // All other branches keep their original topology.
+  // All other branches keep their original topology. Labels / pi-native
+  // compaction entries act as pass-through nodes: dropped, but their children
+  // survive under the same parent.
   const childrenOf = new Map<string | null, Array<Record<string, unknown>>>();
   for (const e of allEntries) {
     const pid = (e.parentId as string | null) ?? null;
@@ -605,7 +665,7 @@ async function deleteSingleEntry(
   // must go too. A user (or compactionSummary) child starts a new turn and is
   // preserved — it gets re-attached to the deleted turn's parent.
   const skipIds = new Set(targetTurn.entries.map((e) => e.id as string));
-  const pending = [...targetTurn.entries];
+  const pending: Array<Record<string, unknown>> = [...targetTurn.entries];
   while (pending.length > 0) {
     const e = pending.pop()!;
     for (const child of childrenOf.get(e.id as string) ?? []) {
@@ -619,29 +679,7 @@ async function deleteSingleEntry(
       }
     }
   }
-  const plan: Array<{
-    entry: Record<string, unknown>;
-    parentId: string | null;
-  }> = [];
-  const walk = (
-    entry: Record<string, unknown>,
-    effectiveParentId: string | null,
-  ) => {
-    if (skipIds.has(entry.id as string)) {
-      for (const c of childrenOf.get(entry.id as string) ?? []) {
-        walk(c, effectiveParentId);
-      }
-      return;
-    }
-    plan.push({ entry, parentId: effectiveParentId });
-    for (const c of childrenOf.get(entry.id as string) ?? []) {
-      walk(c, entry.id as string);
-    }
-  };
-  for (const root of childrenOf.get(null) ?? []) {
-    if (root.type === "session") continue;
-    walk(root, null);
-  }
+  const plan: PlanEntry[] = buildRebuildPlan(allEntries, skipIds, false);
   if (plan.length === 0) {
     throw new Error("Nothing to rebuild.");
   }
@@ -754,7 +792,9 @@ async function handleMerge(
     const srcId = range.startId;
 
     const sm = ctx.sessionManager;
-    const allEntries = sm.getEntries() as Array<Record<string, unknown>>;
+    const allEntries = sm.getEntries() as unknown as Array<
+      Record<string, unknown>
+    >;
     const byId = new Map(allEntries.map((e) => [e.id as string, e]));
 
     // Source must be a distilled summary.
@@ -833,17 +873,57 @@ async function handleMerge(
     // Rebuild segments.
     const segmentA = mainPath.slice(0, pIdx + 1); // root → parent (inclusive)
     const srcOnMain = mainPathIds.has(srcId);
-    // The main-path continuation after the parent (skipping src itself when
-    // the summary sits on the main path).
-    const mainAfterParent = srcOnMain
-      ? mainPath.slice(pIdx + 2)
-      : mainPath.slice(pIdx + 1);
+    // The main-path continuation after the parent, minus the summary itself
+    // (it is appended separately below). Entries between the parent and the
+    // summary (e.g. labels) are kept — slicing from pIdx+2 would duplicate
+    // the summary whenever it is not the parent's direct child.
+    const mainAfterParent = mainPath
+      .slice(pIdx + 1)
+      .filter((e) => (e.id as string) !== srcId);
     // The summary's own subtree (branch content after it, off the main path).
     const srcDescendants = srcOnMain ? [] : collectSubtree(srcId, false);
     // The parent's other side branches — re-attached under the summary.
     const sideRoots = parentChildren.filter(
-      (e) => e.id !== srcId && !mainPathIds.has(e.id as string),
+      (e) => (e.id as string) !== srcId && !mainPathIds.has(e.id as string),
     );
+    // When the summary itself is on the main path (srcDescendants is empty
+    // then), branches forking off it are preserved too.
+    const srcSideRoots = srcOnMain
+      ? allEntries.filter(
+          (c) =>
+            (c.parentId as string | null) === srcId &&
+            !mainPathIds.has(c.id as string),
+        )
+      : [];
+
+    // Off-path subtrees forking off segment-A entries (except the parent,
+    // whose side branches are `sideRoots`) and off the main-path continuation
+    // — preserved in the rebuild so a merge never drops side branches.
+    const mainAll = [...segmentA, ...mainAfterParent];
+    const mainAllIds = new Set(mainAll.map((e) => e.id as string));
+    const offPathSubtrees = new Map<string, Array<Record<string, unknown>>>();
+    for (const e of mainAll) {
+      const kids = allEntries.filter(
+        (c) =>
+          (c.parentId as string | null) === e.id &&
+          !mainAllIds.has(c.id as string),
+      );
+      if (kids.length === 0) continue;
+      const sub: Array<Record<string, unknown>> = [];
+      const walkSub = (id: string) => {
+        for (const c of allEntries.filter(
+          (x) => (x.parentId as string | null) === id,
+        )) {
+          sub.push(c);
+          walkSub(c.id as string);
+        }
+      };
+      for (const k of kids) {
+        sub.push(k);
+        walkSub(k.id as string);
+      }
+      offPathSubtrees.set(e.id as string, sub);
+    }
 
     // Old session handling — same two-step as delete.
     const markChoice = await ctx.ui.select("Delete method", [
@@ -873,29 +953,68 @@ async function handleMerge(
 
     await ctx.newSession({
       parentSession: markOld ? undefined : oldParentSession,
-      setup: (sm2) => {
-        for (const entry of segmentA) {
-          appendEntry(sm2, entry);
+      setup: async (sm2) => {
+        const idMap = new Map<string, string>();
+        let lastNewId: string | undefined;
+
+        const appendChain = (entries: Array<Record<string, unknown>>) => {
+          for (const entry of entries) {
+            const newId = appendEntry(sm2, entry);
+            if (newId) {
+              idMap.set(entry.id as string, newId);
+              lastNewId = newId;
+            } else if (lastNewId) {
+              // Pass-through (label / compaction / branch_summary): not
+              // copied, but children attach under the current tail.
+              idMap.set(entry.id as string, lastNewId);
+            }
+          }
+        };
+
+        // root → parent, preserving off-path subtrees of segment-A entries
+        // (the parent's own side branches are re-attached under the summary).
+        appendChain(segmentA);
+        for (const e of segmentA) {
+          if ((e.id as string) === parentId) continue;
+          const sub = offPathSubtrees.get(e.id as string);
+          if (!sub) continue;
+          const parentNewId = idMap.get(e.id as string);
+          if (!parentNewId) continue;
+          sm2.branch(parentNewId);
+          appendChain(sub);
         }
+
+        const parentNewId = idMap.get(parentId);
+        if (parentNewId) sm2.branch(parentNewId);
         const srcNewId = appendEntry(sm2, srcEntry);
 
         // The summary's own continuation (branch content after it).
-        for (const entry of srcDescendants) {
-          appendEntry(sm2, entry);
+        appendChain(srcDescendants);
+
+        // The summary's own side branches (when it sits on the main path).
+        for (const root of srcSideRoots) {
+          sm2.branch(srcNewId);
+          appendChain(collectSubtree(root.id as string, true));
         }
 
         // The parent's other side branches, re-attached under the summary.
         for (const root of sideRoots) {
           sm2.branch(srcNewId);
-          for (const entry of collectSubtree(root.id as string, true)) {
-            appendEntry(sm2, entry);
-          }
+          appendChain(collectSubtree(root.id as string, true));
         }
 
-        // The main-path continuation, re-attached under the summary.
+        // The main-path continuation, re-attached under the summary; its
+        // off-path subtrees are preserved too.
         sm2.branch(srcNewId);
         for (const entry of mainAfterParent) {
-          appendEntry(sm2, entry);
+          const newId = appendEntry(sm2, entry);
+          if (!newId) continue;
+          const sub = offPathSubtrees.get(entry.id as string);
+          if (sub) {
+            sm2.branch(newId);
+            appendChain(sub);
+            sm2.branch(newId);
+          }
         }
       },
       withSession: async (freshCtx) => {
@@ -928,7 +1047,7 @@ async function handleMerge(
         }
         freshCtx.ui.notify(
           "Merged branch summary into main path",
-          "success",
+          "info",
         );
       },
     });
@@ -985,7 +1104,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
         const on = trimmed.split(/\s+/)[1].toLowerCase() === "on";
         config.contextOn = on;
         saveConfig(config);
-        ctx.ui.notify(`Context background: ${on ? "ON" : "OFF"}`, "success");
+        ctx.ui.notify(`Context background: ${on ? "ON" : "OFF"}`, "info");
         return;
       }
 
@@ -994,7 +1113,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
         const on = trimmed.split(/\s+/)[1].toLowerCase() === "on";
         config.autoClean = on;
         saveConfig(config);
-        ctx.ui.notify(`Auto-clean: ${on ? "ON" : "OFF"}`, "success");
+        ctx.ui.notify(`Auto-clean: ${on ? "ON" : "OFF"}`, "info");
         return;
       }
 
@@ -1014,7 +1133,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
           if (matched) {
             config.summaryModel = `${matched.provider}/${matched.id}`;
             saveConfig(config);
-            ctx.ui.notify(`Summary model: ${config.summaryModel}`, "success");
+            ctx.ui.notify(`Summary model: ${config.summaryModel}`, "info");
           }
         }
         return;
@@ -1031,7 +1150,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
         for (const s of distilled) {
           if (deleteSession(s.path)) deleted++;
         }
-        ctx.ui.notify(`Deleted ${deleted} distilled session(s)`, "success");
+        ctx.ui.notify(`Deleted ${deleted} distilled session(s)`, "info");
         return;
       }
 
@@ -1115,7 +1234,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
 
         // Create replacement session, reconstructing branches from the old tree
         await ctx.newSession({
-          setup: (sm) => {
+          setup: async (sm) => {
             const idMap = new Map<string, string>();
             let anchorNewId: string | undefined;
 
@@ -1124,7 +1243,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
             const archiveData = {
               conversations: result.segmentBC.map((m) => {
                 if (m.type === "message") {
-                  const msg = (m as { message: { role: string; content: unknown } }).message;
+                  const msg = (m as unknown as { message: { role: string; content: unknown } }).message;
                   return {
                     role: msg.role,
                     content:
@@ -1133,7 +1252,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
                         : JSON.stringify(msg.content),
                   };
                 }
-                const ce = m as { content: unknown };
+                const ce = m as unknown as { content: unknown };
                 return {
                   role: "distilled_summary",
                   content:
@@ -1154,34 +1273,16 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
             // replaced by a fresh compactionSummary and the range's
             // descendants are re-attached under it.
             if (result.plan) {
-              let summaryNewId: string | undefined;
-              for (const { entry, parentId, insertSummary } of result.plan) {
-                if (parentId) {
-                  const parentNewId =
-                    parentId === "__summary__"
-                      ? summaryNewId
-                      : idMap.get(parentId);
-                  if (!parentNewId) continue;
-                  sm.branch(parentNewId);
-                }
-                let newId: string | undefined;
-                if (insertSummary) {
-                  const summaryContent =
-                    `<distilled-summary turns="${result.turnCount}" messages="${result.segmentBC.length}">\n` +
-                    `${finalSummary}\n` +
-                    `</distilled-summary>`;
-                  newId = sm.appendMessage({
-                    role: "compactionSummary",
-                    summary: summaryContent,
-                    tokensBefore: estimateTokens(result.segmentBC),
-                    timestamp: Date.now(),
-                  });
-                  summaryNewId = newId;
-                } else {
-                  newId = appendEntry(sm, entry);
-                }
-                if (newId) idMap.set(entry.id as string, newId);
-              }
+              const summaryContent =
+                `<distilled-summary turns="${result.turnCount}" messages="${result.segmentBC.length}">\n` +
+                `${finalSummary}\n` +
+                `</distilled-summary>`;
+              rebuildPlanEntries(
+                sm,
+                result.plan,
+                summaryContent,
+                estimateTokens(result.segmentBC),
+              );
               sm.appendCustomEntry("distilled-archive", archiveData);
               return;
             }
@@ -1192,6 +1293,11 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
               if (newId) {
                 idMap.set(entry.id as string, newId);
                 anchorNewId = newId;
+              } else if (anchorNewId) {
+                // Pass-through entry (label / compaction / branch_summary):
+                // not copied, but branches forking off it attach under the
+                // current anchor.
+                idMap.set(entry.id as string, anchorNewId);
               }
             }
 
@@ -1224,7 +1330,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
               summary: summaryContent,
               tokensBefore: estimateTokens(result.segmentBC),
               timestamp: Date.now(),
-            });
+            } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
 
             // Copy segment D (all entry types)
             for (const entry of result.segmentD) {
@@ -1247,7 +1353,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
                 markDistilledTitle(oldSessionFile, oldTitle);
               }
             }
-            freshCtx.ui.notify("✅ Distilled", "success");
+            freshCtx.ui.notify("✅ Distilled", "info");
           },
         });
       } catch (err) {
@@ -1300,7 +1406,9 @@ export function registerSessionGuards(pi: ExtensionAPI): void {
 
   // When a freshly forked session receives its first NEW user message,
   // set that message as the session title (so it doesn't inherit the
-  // source session's stale first message).
+  // source session's stale first message). pi.setSessionName appends the
+  // session_info entry to the LIVE session manager (and persists it), so
+  // the title shows immediately instead of only after the next reload.
   pi.on("message_start", (event, ctx) => {
     if (!pendingForkSession) return;
     if (event.message.role !== "user") return;
@@ -1308,9 +1416,8 @@ export function registerSessionGuards(pi: ExtensionAPI): void {
 
     const text = extractMessageText(event.message.content).trim();
     if (text) {
-      const title = text.slice(0, 60);
       try {
-        SessionManager.open(pendingForkSession).appendSessionInfo(title);
+        pi.setSessionName(text.slice(0, 60));
       } catch {
         // Non-fatal: title assignment is best-effort.
       }

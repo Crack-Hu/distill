@@ -330,13 +330,13 @@ export function buildRebuildPlan(
             id: SUMMARY_ANCHOR,
             parentId: null,
             message: {},
-          } as AnyEntry,
+          } as unknown as AnyEntry,
           parentId: effParent,
           insertSummary: true,
         });
       }
       for (const c of childrenOf.get(entry.id as string) ?? []) {
-        if (PASSTHROUGH_TYPES.has(c.type)) {
+        if (PASSTHROUGH_TYPES.has(c.type as string)) {
           // A label targeting a compressed node is dropped with it, but its
           // children (continuation messages) survive under the summary.
           for (const g of childrenOf.get(c.id as string) ?? []) {
@@ -348,7 +348,7 @@ export function buildRebuildPlan(
       }
       return;
     }
-    if (PASSTHROUGH_TYPES.has(entry.type)) {
+    if (PASSTHROUGH_TYPES.has(entry.type as string)) {
       for (const c of childrenOf.get(entry.id as string) ?? []) {
         walk(c, effParent);
       }
@@ -379,7 +379,9 @@ export async function executeCompact(
   // ... (same resolution logic until we have segmentBC)
 
   const sm = ctx.sessionManager;
-  const allEntries = sm.getEntries() as Array<Record<string, unknown>>;
+  const allEntries = sm.getEntries() as unknown as Array<
+    Record<string, unknown>
+  >;
 
   // Build lookup map
   const byId = new Map<string, Record<string, unknown>>();
@@ -406,7 +408,11 @@ export async function executeCompact(
   }
 
   // Ensure start and end are on the same branch
-  const pathCheck = buildPath(byId, startId, endId);
+  const pathCheck = buildPath(
+    byId as unknown as Map<string, AnyEntry>,
+    startId,
+    endId,
+  );
   if (pathCheck.length === 0) {
     throw new Error(
       `Labels "${range.startLabel}" and "${endLabelDesc}" are not on the same path.`,
@@ -462,7 +468,9 @@ export async function executeCompact(
     effectiveStartId = snapToMessageOn(branchPath, startId, "forward");
     effectiveEndId = snapToMessageOn(branchPath, endId, "backward");
 
-    const turns = groupPathIntoTurns(branchPath);
+    const turns = groupPathIntoTurns(
+      branchPath as unknown as AnyEntry[],
+    );
     const fullStartTurn = turns.findIndex((t) =>
       t.messages.some((m) => m.id === effectiveStartId),
     );
@@ -519,48 +527,10 @@ export async function executeCompact(
 
     // Whole-tree rebuild plan: every entry in DFS order, the range replaced
     // by a fresh summary at the range start, the range's descendants
-    // re-attached under it.
-    const childrenOf = new Map<string | null, AnyEntry[]>();
-    for (const e of allEntries) {
-      const pid = (e.parentId as string | null) ?? null;
-      const list = childrenOf.get(pid);
-      if (list) list.push(e);
-      else childrenOf.set(pid, [e]);
-    }
-    plan = [];
-    const SUMMARY_ANCHOR = "__summary__";
-    let inserted = false;
-    const walk = (entry: AnyEntry, effParent: string | null) => {
-      if (bcIds.has(entry.id as string)) {
-        if (!inserted) {
-          inserted = true;
-          plan!.push({
-            entry: {
-              type: "message",
-              id: SUMMARY_ANCHOR,
-              parentId: null,
-              message: {},
-            },
-            parentId: effParent,
-            insertSummary: true,
-          });
-        }
-        for (const c of childrenOf.get(entry.id as string) ?? []) {
-          // Labels targeting compressed nodes are dropped with them.
-          if (c.type === "label") continue;
-          walk(c, SUMMARY_ANCHOR);
-        }
-        return;
-      }
-      plan!.push({ entry, parentId: effParent });
-      for (const c of childrenOf.get(entry.id as string) ?? []) {
-        walk(c, entry.id as string);
-      }
-    };
-    for (const root of childrenOf.get(null) ?? []) {
-      if (root.type === "session") continue;
-      walk(root, null);
-    }
+    // re-attached under it. Labels / pi-native compaction entries inside the
+    // range act as pass-through nodes: dropped with the range, but their
+    // children (continuation messages) survive under the summary.
+    plan = buildRebuildPlan(allEntries, bcIds, true);
   } else {
     // ---- main-path range ----
     // Branch check — reject if branches inside compressed range. Children
@@ -575,7 +545,7 @@ export async function executeCompact(
     effectiveEndId = snapToMessageOn(fullPath, endId, "backward");
 
     // Group the FULL path (all entry types) into turns.
-    const turns = groupPathIntoTurns(fullPath);
+    const turns = groupPathIntoTurns(fullPath as unknown as AnyEntry[]);
 
     // Find the turn containing effectiveStartId
     const fullStartTurn = turns.findIndex((t) =>
@@ -666,8 +636,10 @@ export async function executeCompact(
   }
 
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok) throw new Error(`Model auth failed: ${auth.error}`);
-  if (!auth.apiKey) throw new Error(`Model "${model.id}" missing API key.`);
+  const authError = (auth as { error?: string }).error;
+  if (!auth.ok) throw new Error(`Model auth failed: ${authError ?? "unknown error"}`);
+  // Header-only auth (e.g. compatibility headers without an API key) is fine:
+  // complete() accepts an undefined apiKey when the headers carry the auth.
 
   // Generate summary
   ctx.ui.notify("Generating summary...", "info");
