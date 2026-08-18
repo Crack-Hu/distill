@@ -228,7 +228,21 @@ async function deleteAsNewSession(
   const sessionDir = ctx.sessionManager.getSessionDir();
   const cwd = ctx.cwd;
 
+  // In-place rebuild keeps the old session's tree position: read its parent
+  // so the fresh session lands where the old one was.
+  let oldParentSession: string | undefined;
+  try {
+    oldParentSession = SessionManager.open(
+      oldSessionFile,
+    ).getHeader()?.parentSession;
+  } catch {
+    // Non-fatal: fall back to a root session.
+  }
+
   await ctx.newSession({
+    // Keep the old session's position unless the old session is kept and
+    // re-parented under the new one (new-session mode).
+    parentSession: markOld ? undefined : oldParentSession,
     setup: (sm) => {
       const idMap = new Map<string, string>();
       let anchorNewId: string | undefined;
@@ -277,13 +291,33 @@ async function deleteAsNewSession(
     },
     withSession: async (freshCtx) => {
       const newSessionFile = freshCtx.sessionManager.getSessionFile();
-      if (oldSessionFile && newSessionFile && markOld) {
-        if (config.autoClean) {
-          deleteSession(oldSessionFile);
+      if (oldSessionFile && newSessionFile) {
+        if (markOld) {
+          // New session: keep the old one, marked [distilled] (or auto-clean).
+          if (config.autoClean) {
+            deleteSession(oldSessionFile);
+          } else {
+            await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
+            setParentSession(oldSessionFile, newSessionFile);
+            markDistilledTitle(oldSessionFile, oldTitle);
+          }
         } else {
-          await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
-          setParentSession(oldSessionFile, newSessionFile);
-          markDistilledTitle(oldSessionFile, oldTitle);
+          // In place: rebuild into a fresh session and remove the old file so
+          // no leftover copy appears in the tree — "no trace". Re-parent the
+          // old session's children under the fresh one to keep the tree
+          // connected.
+          deleteSession(oldSessionFile);
+          try {
+            const sessions = await SessionManager.list(cwd, sessionDir);
+            for (const s of sessions) {
+              if (s.path === oldSessionFile) continue;
+              if (s.parentSessionPath === oldSessionFile) {
+                setParentSession(s.path, newSessionFile);
+              }
+            }
+          } catch {
+            // Non-fatal: orphaned children fall back to roots.
+          }
         }
       }
       freshCtx.ui.notify(
@@ -827,7 +861,18 @@ async function handleMerge(
     const sessionDir = sm.getSessionDir();
     const cwd = ctx.cwd;
 
+    // In-place rebuild keeps the old session's tree position.
+    let oldParentSession: string | undefined;
+    try {
+      oldParentSession = SessionManager.open(
+        oldSessionFile,
+      ).getHeader()?.parentSession;
+    } catch {
+      // Non-fatal: fall back to a root session.
+    }
+
     await ctx.newSession({
+      parentSession: markOld ? undefined : oldParentSession,
       setup: (sm2) => {
         for (const entry of segmentA) {
           appendEntry(sm2, entry);
@@ -855,13 +900,30 @@ async function handleMerge(
       },
       withSession: async (freshCtx) => {
         const newSessionFile = freshCtx.sessionManager.getSessionFile();
-        if (oldSessionFile && newSessionFile && markOld) {
-          if (config.autoClean) {
-            deleteSession(oldSessionFile);
+        if (oldSessionFile && newSessionFile) {
+          if (markOld) {
+            if (config.autoClean) {
+              deleteSession(oldSessionFile);
+            } else {
+              await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
+              setParentSession(oldSessionFile, newSessionFile);
+              markDistilledTitle(oldSessionFile, oldTitle);
+            }
           } else {
-            await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
-            setParentSession(oldSessionFile, newSessionFile);
-            markDistilledTitle(oldSessionFile, oldTitle);
+            // In place: remove the old session file — no leftover copy.
+            // Re-parent its children under the fresh session.
+            deleteSession(oldSessionFile);
+            try {
+              const sessions = await SessionManager.list(cwd, sessionDir);
+              for (const s of sessions) {
+                if (s.path === oldSessionFile) continue;
+                if (s.parentSessionPath === oldSessionFile) {
+                  setParentSession(s.path, newSessionFile);
+                }
+              }
+            } catch {
+              // Non-fatal: orphaned children fall back to roots.
+            }
           }
         }
         freshCtx.ui.notify(

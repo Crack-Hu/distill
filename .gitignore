@@ -11,3 +11,6 @@ config.json
 node_modules/
 tests/
 
+
+# pi 本地项目配置
+.pi/

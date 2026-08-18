@@ -34,6 +34,16 @@ type AnyEntry = SessionEntryBase & Record<string, unknown>;
 
 export type { AnyEntry };
 
+/**
+ * Entry types that cannot be copied into a rebuilt session: labels reference
+ * the OLD target entry IDs, and pi-native compaction / branch_summary entries
+ * carry pi's own compaction state. In tree rebuilds they act as pass-through
+ * nodes — the entry itself is dropped, but its children are re-attached under
+ * the entry's parent (a tag in pi moves the leaf onto the label entry, so the
+ * next message is a CHILD of the label — dropping the label must not drop it).
+ */
+export const PASSTHROUGH_TYPES = new Set(["label", "compaction", "branch_summary"]);
+
 // ---- turn grouping --------------------------------------------------------
 
 /**

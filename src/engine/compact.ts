@@ -14,6 +14,7 @@ import { dirname, join } from "node:path";
 import {
   buildPath,
   groupPathIntoTurns,
+  PASSTHROUGH_TYPES,
   resolveLabel,
 } from "./turn-group";
 import type { AnyEntry } from "./turn-group";
@@ -290,6 +291,79 @@ export interface PlanEntry {
   parentId: string | null;
   /** Insert a fresh compactionSummary here instead of copying the entry. */
   insertSummary?: boolean;
+}
+
+/**
+ * Build a whole-tree rebuild plan: every entry in DFS order, plus the parent
+ * each entry must be re-attached under. The compressed range is replaced by a
+ * summary slot (insertSummary) — or removed entirely (delete mode) — and the
+ * range's descendants are re-attached under the range's parent.
+ *
+ * Pass-through entries (labels, pi-native compaction / branch_summary) cannot
+ * be copied because they reference old entry IDs; they are dropped and their
+ * children are re-attached under the same parent, so a tag sitting between
+ * messages never orphans the conversation that follows it.
+ */
+export function buildRebuildPlan(
+  allEntries: Array<Record<string, unknown>>,
+  rangeIds: Set<string>,
+  insertSummary: boolean,
+): PlanEntry[] {
+  const childrenOf = new Map<string | null, Array<Record<string, unknown>>>();
+  for (const e of allEntries) {
+    const pid = (e.parentId as string | null) ?? null;
+    const list = childrenOf.get(pid);
+    if (list) list.push(e);
+    else childrenOf.set(pid, [e]);
+  }
+
+  const plan: PlanEntry[] = [];
+  const SUMMARY_ANCHOR = "__summary__";
+  let inserted = false;
+  const walk = (entry: Record<string, unknown>, effParent: string | null) => {
+    if (rangeIds.has(entry.id as string)) {
+      if (insertSummary && !inserted) {
+        inserted = true;
+        plan.push({
+          entry: {
+            type: "message",
+            id: SUMMARY_ANCHOR,
+            parentId: null,
+            message: {},
+          } as AnyEntry,
+          parentId: effParent,
+          insertSummary: true,
+        });
+      }
+      for (const c of childrenOf.get(entry.id as string) ?? []) {
+        if (PASSTHROUGH_TYPES.has(c.type)) {
+          // A label targeting a compressed node is dropped with it, but its
+          // children (continuation messages) survive under the summary.
+          for (const g of childrenOf.get(c.id as string) ?? []) {
+            walk(g, insertSummary ? SUMMARY_ANCHOR : effParent);
+          }
+          continue;
+        }
+        walk(c, insertSummary ? SUMMARY_ANCHOR : effParent);
+      }
+      return;
+    }
+    if (PASSTHROUGH_TYPES.has(entry.type)) {
+      for (const c of childrenOf.get(entry.id as string) ?? []) {
+        walk(c, effParent);
+      }
+      return;
+    }
+    plan.push({ entry: entry as AnyEntry, parentId: effParent });
+    for (const c of childrenOf.get(entry.id as string) ?? []) {
+      walk(c, entry.id as string);
+    }
+  };
+  for (const root of childrenOf.get(null) ?? []) {
+    if (root.type === "session") continue;
+    walk(root, null);
+  }
+  return plan;
 }
 
 /**
