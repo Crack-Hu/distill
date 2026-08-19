@@ -796,6 +796,10 @@ async function handleDelete(
     );
     await deleteAsNewSession(result, ctx, config, markOld);
   } catch (err) {
+    if (err instanceof SummaryCancelledError) {
+      ctx.ui.notify("Summary generation cancelled", "warning");
+      return;
+    }
     const message = err instanceof Error ? err.message : String(err);
     ctx.ui.notify(`Delete failed: ${message}`, "error");
   }
@@ -1204,6 +1208,10 @@ async function handleMerge(
       },
     });
   } catch (err) {
+    if (err instanceof SummaryCancelledError) {
+      ctx.ui.notify("Summary generation cancelled", "warning");
+      return;
+    }
     const message = err instanceof Error ? err.message : String(err);
     ctx.ui.notify(`Merge failed: ${message}`, "error");
   }
@@ -1840,6 +1848,10 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
           },
         });
       } catch (err) {
+        if (err instanceof SummaryCancelledError) {
+          ctx.ui.notify("Summary generation cancelled", "warning");
+          return;
+        }
         const message = err instanceof Error ? err.message : String(err);
         ctx.ui.notify(`Distill failed: ${message}`, "error");
       }

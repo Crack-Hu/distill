@@ -7,6 +7,12 @@
 import { uuidv7 } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type {
+  Component,
+  KeybindingsManager,
+  Theme,
+  TUI,
+} from "@earendil-works/pi-tui";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -206,6 +212,128 @@ function getBackgroundMessages(
 }
 
 // ---- summary generation ---------------------------------------------------
+
+/** Thrown when the user cancels summary generation with Esc. */
+export class SummaryCancelledError extends Error {
+  constructor() {
+    super("Summary generation cancelled.");
+    this.name = "SummaryCancelledError";
+  }
+}
+
+const SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+
+/**
+ * Small overlay shown while the summary is being generated: a spinner line
+ * plus the user's configured interrupt key (Esc by default). Aborting closes
+ * the overlay with "cancel"; a settled generation closes it with "done"
+ * (success or failure — the caller re-awaits the generation to see errors).
+ */
+class GeneratingNotice implements Component {
+  private settled = false;
+  private frame = 0;
+  private ticker: ReturnType<typeof setInterval> | undefined;
+  private readonly finish: (result: "done" | "cancel") => void;
+
+  constructor(
+    private readonly tui: TUI,
+    private readonly theme: Theme,
+    private readonly keybindings: KeybindingsManager,
+    generation: Promise<unknown>,
+    done: (result: "done" | "cancel") => void,
+  ) {
+    this.finish = (result) => {
+      if (this.settled) return;
+      this.settled = true;
+      if (this.ticker) clearInterval(this.ticker);
+      done(result);
+    };
+    // Close the overlay when the generation settles, success or failure.
+    void generation.then(
+      () => this.finish("done"),
+      () => this.finish("done"),
+    );
+    this.ticker = setInterval(() => {
+      this.frame++;
+      this.tui.requestRender();
+    }, 100);
+  }
+
+  handleInput(data: string): void {
+    // app.interrupt honors the user's keybinding config (Esc by default).
+    if (this.keybindings.matches(data, "app.interrupt")) {
+      this.finish("cancel");
+    }
+  }
+
+  render(width: number): string[] {
+    const spin = SPINNER_FRAMES[this.frame % SPINNER_FRAMES.length];
+    const key = this.keybindings.getKeys("app.interrupt")?.[0] ?? "esc";
+    const text = `${spin} Generating summary…  (${key} to cancel)`;
+    // Slice the PLAIN text first — slicing styled text would cut the ANSI
+    // escape sequences and corrupt the render.
+    return [this.theme.fg("dim", text.slice(0, width))];
+  }
+
+  invalidate(): void {}
+
+  dispose(): void {
+    if (this.ticker) clearInterval(this.ticker);
+  }
+}
+
+/**
+ * Run summary generation behind a cancellable overlay. Returns the summary,
+ * or throws SummaryCancelledError when the user aborts with Esc. Without a
+ * dialog-capable UI (rpc/json mode) the generation runs without cancellation.
+ */
+async function generateSummaryWithCancel(
+  rangeMessages: AnyEntry[],
+  backgroundMessages: AnyEntry[],
+  supplement: string | undefined,
+  contextOn: boolean,
+  model: Parameters<typeof complete>[0],
+  apiKey: string | undefined,
+  headers: Record<string, string> | undefined,
+  env: Record<string, string> | undefined,
+  ctx: ExtensionCommandContext,
+): Promise<string> {
+  const controller = new AbortController();
+  const generation = generateSummary(
+    rangeMessages,
+    backgroundMessages,
+    supplement,
+    contextOn,
+    model,
+    apiKey,
+    headers,
+    env,
+    controller.signal,
+  );
+
+  if (!ctx.hasUI) return generation;
+
+  const outcome = await ctx.ui.custom<"done" | "cancel">(
+    (tui, theme, keybindings, done) =>
+      new GeneratingNotice(tui, theme, keybindings, generation, done),
+    {
+      overlay: true,
+      // Overlays are NOT focused by default (pi only setFocus()es non-overlay
+      // components) — without this the keys go to the editor and the notice
+      // can never see the Esc press.
+      onHandle: (handle) => handle.focus(),
+    },
+  );
+
+  if (outcome === "cancel") {
+    controller.abort();
+    // Wait for the request to settle so nothing keeps running in the
+    // background after the overlay is gone.
+    await generation.catch(() => {});
+    throw new SummaryCancelledError();
+  }
+  return generation;
+}
 
 async function generateSummary(
   rangeMessages: AnyEntry[],
@@ -642,9 +770,8 @@ export async function executeCompact(
   // complete() accepts an undefined apiKey when the headers carry the auth.
 
   // Generate summary
-  ctx.ui.notify("Generating summary...", "info");
-
-  const summary = await generateSummary(
+  // Generate summary (cancellable with Esc via an overlay)
+  const summary = await generateSummaryWithCancel(
     segmentBC,
     backgroundMessages,
     range.supplement,
@@ -653,7 +780,7 @@ export async function executeCompact(
     auth.apiKey,
     auth.headers,
     auth.env,
-    ctx.signal ?? new AbortController().signal,
+    ctx,
   );
 
   if (!summary.trim()) {
