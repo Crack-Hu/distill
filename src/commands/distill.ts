@@ -135,10 +135,18 @@ export function rebuildPlanEntries(
   plan: PlanEntry[],
   summaryContent: string | undefined,
   tokensBefore: number,
+  /**
+   * Restore the leaf to this entry's new position after the rebuild. The
+   * plan is replayed in DFS (file) order, so without this the leaf ends up
+   * at the last copied entry — which is NOT necessarily the user's position
+   * (branches that come later in file order would swallow it).
+   */
+  targetLeafId?: string,
 ): void {
   const idMap = new Map<string, string | null>();
   let summaryNewId: string | undefined;
   let summaryParentNewId: string | null | undefined;
+  let targetNewId: string | null | undefined;
 
   for (const { entry, parentId, insertSummary } of plan) {
     if (insertSummary) {
@@ -171,9 +179,18 @@ export function rebuildPlanEntries(
     if (parentId && !effParent) continue;
     if (effParent) sm.branch(effParent);
     const newId = appendEntry(sm, entry);
-    if (newId) idMap.set(entry.id as string, newId);
-    else if (effParent) idMap.set(entry.id as string, effParent);
+    if (newId) {
+      idMap.set(entry.id as string, newId);
+      if ((entry.id as string) === targetLeafId) targetNewId = newId;
+    } else if (effParent) {
+      idMap.set(entry.id as string, effParent);
+    }
   }
+
+  // Jump the leaf back to the user's position. If the original leaf was
+  // inside the removed/compressed range it has no mapping and the leaf stays
+  // where the rebuild left it.
+  if (targetNewId) sm.branch(targetNewId);
 }
 
 // ---- distill bookkeeping helpers -----------------------------------------
@@ -293,6 +310,7 @@ async function deleteAsNewSession(
 ): Promise<void> {
   const oldSessionFile = ctx.sessionManager.getSessionFile();
   const oldTitle = ctx.sessionManager.getSessionName();
+  const oldLeafId = ctx.sessionManager.getLeafId();
   const sessionDir = ctx.sessionManager.getSessionDir();
   const cwd = ctx.cwd;
 
@@ -322,7 +340,9 @@ async function deleteAsNewSession(
         // Range-delete (drop) carries the plan's summary slot for topology;
         // no summary is inserted and the range's descendants are re-attached
         // under the slot's parent (rebuildPlanEntries with undefined content).
-        rebuildPlanEntries(sm, result.plan, undefined, 0);
+        // Deleting another branch must not move the user's position: restore
+        // the leaf to its remapped entry.
+        rebuildPlanEntries(sm, result.plan, undefined, 0, oldLeafId ?? undefined);
         return;
       }
 
@@ -1688,6 +1708,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
         // Capture old session metadata before creating the replacement
         const oldSessionFile = ctx.sessionManager.getSessionFile();
         const oldTitle = ctx.sessionManager.getSessionName();
+        const oldLeafId = ctx.sessionManager.getLeafId();
         const sessionDir = ctx.sessionManager.getSessionDir();
         const cwd = ctx.cwd;
 
@@ -1736,11 +1757,14 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
                 `<distilled-summary turns="${result.turnCount}" messages="${result.segmentBC.length}">\n` +
                 `${finalSummary}\n` +
                 `</distilled-summary>`;
+              // Restore the user's position: the plan replay ends at the last
+              // DFS entry, which is not necessarily the original leaf.
               rebuildPlanEntries(
                 sm,
                 result.plan,
                 summaryContent,
                 estimateTokens(result.segmentBC),
+                oldLeafId ?? undefined,
               );
               sm.appendCustomEntry("distilled-archive", archiveData);
               return;
