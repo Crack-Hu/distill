@@ -12,10 +12,18 @@ import {
   type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 
-import { executeCompact, type PlanEntry } from "../engine/compact";
+import {
+  executeCompact,
+  SummaryCancelledError,
+  type PlanEntry,
+} from "../engine/compact";
 import { buildRebuildPlan } from "../engine/compact";
 import type { DistillConfig } from "../engine/compact";
-import { groupPathIntoTurns, resolveAllLabels } from "../engine/turn-group";
+import {
+  groupPathIntoTurns,
+  PASSTHROUGH_TYPES,
+  resolveAllLabels,
+} from "../engine/turn-group";
 import type { AnyEntry } from "../engine/turn-group";
 import { deleteSession, setParentSession } from "../engine/session-io";
 
@@ -774,20 +782,226 @@ async function handleDelete(
 }
 
 /**
+ * Collect a node's non-main-path subtree, flattened in pre-order (the node
+ * itself included when includeRoot is set). Pass-through entries (labels,
+ * pi-native compaction) are included — the rebuild drops them while keeping
+ * their children attached under the same parent.
+ */
+export function collectOffPathSubtree(
+  byId: Map<string, Record<string, unknown>>,
+  allEntries: Array<Record<string, unknown>>,
+  mainPathIds: Set<string>,
+  rootId: string,
+  includeRoot: boolean,
+): Array<Record<string, unknown>> {
+  const result: Array<Record<string, unknown>> = [];
+  const walk = (id: string, first: boolean) => {
+    const node = byId.get(id);
+    if (!node) return;
+    if (!first || includeRoot) result.push(node);
+    for (const child of allEntries.filter(
+      (e) =>
+        (e.parentId as string | null) === id &&
+        !mainPathIds.has(e.id as string),
+    )) {
+      walk(child.id as string, false);
+    }
+  };
+  walk(rootId, true);
+  return result;
+}
+
+/**
+ * Compute the shared merge segments for a fork point `parentId` on the main
+ * path, where the branch node `mergedId` is replaced by / merged into a
+ * summary under the parent.
+ *
+ * Returns: root → parent (segmentA), the main-path continuation after the
+ * parent (minus the branch itself), the parent's other side branches, and
+ * off-path subtrees forking off segment-A / continuation entries (preserved
+ * so a merge never drops side branches).
+ */
+export function computeMergeSegments(
+  allEntries: Array<Record<string, unknown>>,
+  byId: Map<string, Record<string, unknown>>,
+  mainPath: Array<Record<string, unknown>>,
+  parentId: string,
+  mergedId: string,
+): {
+  segmentA: Array<Record<string, unknown>>;
+  mainAfterParent: Array<Record<string, unknown>>;
+  sideRoots: Array<Record<string, unknown>>;
+  offPathSubtrees: Map<string, Array<Record<string, unknown>>>;
+} {
+  const mainPathIds = new Set(mainPath.map((e) => e.id as string));
+  const pIdx = mainPath.findIndex((e) => (e.id as string) === parentId);
+  if (pIdx === -1) {
+    throw new Error("Parent node is not on the current path.");
+  }
+
+  // The merged branch's own chain (mergedId up to parentId, including any
+  // pass-through entries in between) is not a "side branch".
+  const branchChain = new Set<string>();
+  let anc: string | undefined = mergedId;
+  while (anc && anc !== parentId) {
+    branchChain.add(anc);
+    anc = (byId.get(anc)?.parentId as string | null) ?? undefined;
+  }
+
+  const segmentA = mainPath.slice(0, pIdx + 1); // root → parent (inclusive)
+  // The main-path continuation after the parent, minus the branch itself
+  // (it is merged below). Entries between the parent and the branch (e.g.
+  // labels) are kept — slicing from pIdx+2 would duplicate the branch
+  // whenever it is not the parent's direct child.
+  const mainAfterParent = mainPath
+    .slice(pIdx + 1)
+    .filter((e) => (e.id as string) !== mergedId);
+  const sideRoots = allEntries.filter(
+    (e) =>
+      (e.parentId as string | null) === parentId &&
+      !branchChain.has(e.id as string) &&
+      !mainPathIds.has(e.id as string),
+  );
+
+  // Off-path subtrees forking off segment-A entries (except the parent,
+  // whose side branches are `sideRoots`) and off the main-path continuation
+  // — preserved in the rebuild.
+  const mainAll = [...segmentA, ...mainAfterParent];
+  const mainAllIds = new Set(mainAll.map((e) => e.id as string));
+  const offPathSubtrees = new Map<string, Array<Record<string, unknown>>>();
+  for (const e of mainAll) {
+    const kids = allEntries.filter(
+      (c) =>
+        (c.parentId as string | null) === e.id &&
+        !mainAllIds.has(c.id as string),
+    );
+    if (kids.length === 0) continue;
+    const sub: Array<Record<string, unknown>> = [];
+    const walkSub = (id: string) => {
+      for (const c of allEntries.filter(
+        (x) => (x.parentId as string | null) === id,
+      )) {
+        sub.push(c);
+        walkSub(c.id as string);
+      }
+    };
+    for (const k of kids) {
+      sub.push(k);
+      walkSub(k.id as string);
+    }
+    offPathSubtrees.set(e.id as string, sub);
+  }
+
+  return { segmentA, mainAfterParent, sideRoots, offPathSubtrees };
+}
+
+/**
+ * Rebuild a session with the merge topology: root → parent, then a merged
+ * node (the summary) under the parent with optional pre-attached entries,
+ * and the parent's other side branches plus the main-path continuation
+ * re-attached under the merged node.
+ *
+ * Returns the new id of the merged node.
+ */
+export function rebuildMerged(
+  sm: SessionManager,
+  opts: {
+    segmentA: Array<Record<string, unknown>>;
+    mainAfterParent: Array<Record<string, unknown>>;
+    sideSubtrees: Array<Array<Record<string, unknown>>>;
+    offPathSubtrees: Map<string, Array<Record<string, unknown>>>;
+    parentId: string;
+    /** Entries appended directly under the merged node, in order. */
+    underMerged: Array<Record<string, unknown>>;
+    /** Append the merged node (the summary); returns its new id. */
+    appendMerged: (
+      sm: SessionManager,
+      parentNewId: string | undefined,
+    ) => string | undefined;
+  },
+): string | undefined {
+  const { segmentA, mainAfterParent, offPathSubtrees, parentId } = opts;
+  const idMap = new Map<string, string>();
+  let lastNewId: string | undefined;
+
+  const appendChain = (entries: Array<Record<string, unknown>>) => {
+    for (const entry of entries) {
+      const newId = appendEntry(sm, entry);
+      if (newId) {
+        idMap.set(entry.id as string, newId);
+        lastNewId = newId;
+      } else if (lastNewId) {
+        // Pass-through (label / compaction / branch_summary): not copied,
+        // but children attach under the current tail.
+        idMap.set(entry.id as string, lastNewId);
+      }
+    }
+  };
+
+  // root → parent, preserving off-path subtrees of segment-A entries (the
+  // parent's own side branches are re-attached under the merged node).
+  appendChain(segmentA);
+  for (const e of segmentA) {
+    if ((e.id as string) === parentId) continue;
+    const sub = offPathSubtrees.get(e.id as string);
+    if (!sub) continue;
+    const parentNewId = idMap.get(e.id as string);
+    if (!parentNewId) continue;
+    sm.branch(parentNewId);
+    appendChain(sub);
+  }
+
+  const parentNewId = idMap.get(parentId);
+  if (parentNewId) sm.branch(parentNewId);
+  const mergedNewId = opts.appendMerged(sm, parentNewId);
+
+  // Entries that sit directly under the merged node (its own continuation).
+  appendChain(opts.underMerged);
+
+  // The parent's other side branches, re-attached under the merged node.
+  for (const sub of opts.sideSubtrees) {
+    if (!mergedNewId) continue;
+    sm.branch(mergedNewId);
+    appendChain(sub);
+  }
+
+  // The main-path continuation, re-attached under the merged node; its
+  // off-path subtrees are preserved too.
+  if (mergedNewId) sm.branch(mergedNewId);
+  for (const entry of mainAfterParent) {
+    const newId = appendEntry(sm, entry);
+    if (!newId) continue;
+    const sub = offPathSubtrees.get(entry.id as string);
+    if (sub) {
+      sm.branch(newId);
+      appendChain(sub);
+      sm.branch(newId);
+    }
+  }
+  return mergedNewId;
+}
+
+/**
  * Merge a distilled summary from a side branch into the main path, placing a
  * copy of it right after the fork turn it originated from. Only a
  * compactionSummary can be merged — copying an ordinary user/assistant
  * message would drag its question → answer pair into a foreign position and
  * corrupt the context.
+ *
+ * `preResolvedId` skips label resolution (used by handleMergeOrSummarize,
+ * which has already disambiguated the label).
  */
 async function handleMerge(
   srcLabel: string,
   ctx: ExtensionCommandContext,
   config: DistillConfig,
+  preResolvedId?: string,
 ): Promise<void> {
   try {
     // Resolve the label — duplicate tags prompt the user to disambiguate.
-    const range = await resolveRange({ startLabel: srcLabel }, ctx);
+    const range = preResolvedId
+      ? { startId: preResolvedId, endId: "", pair: false }
+      : await resolveRange({ startLabel: srcLabel }, ctx);
     if (!range) return; // user cancelled
     const srcId = range.startId;
 
@@ -812,7 +1026,15 @@ async function handleMerge(
 
     // The summary must be the first message of a branch: its parent is the
     // fork point, and that parent must have more than one child branch.
-    const parentId = srcEntry.parentId as string | null;
+    // Walk through any pass-through entries (labels etc.) sitting between
+    // the summary and the fork point.
+    let parentId = srcEntry.parentId as string | null;
+    while (
+      parentId &&
+      PASSTHROUGH_TYPES.has(byId.get(parentId)?.type as string)
+    ) {
+      parentId = byId.get(parentId)?.parentId as string | null;
+    }
     if (!parentId) {
       ctx.ui.notify("Summary has no parent node.", "warning");
       return;
@@ -849,43 +1071,16 @@ async function handleMerge(
     }
 
     // Collect a node's non-main-path subtree, flattened in order.
-    const collectSubtree = (
-      rootId: string,
-      includeRoot: boolean,
-    ): Array<Record<string, unknown>> => {
-      const result: Array<Record<string, unknown>> = [];
-      const walk = (id: string, first: boolean) => {
-        const node = byId.get(id);
-        if (!node) return;
-        if (!first || includeRoot) result.push(node);
-        for (const child of allEntries.filter(
-          (e) =>
-            (e.parentId as string | null) === id &&
-            !mainPathIds.has(e.id as string),
-        )) {
-          walk(child.id as string, false);
-        }
-      };
-      walk(rootId, true);
-      return result;
-    };
-
-    // Rebuild segments.
-    const segmentA = mainPath.slice(0, pIdx + 1); // root → parent (inclusive)
     const srcOnMain = mainPathIds.has(srcId);
-    // The main-path continuation after the parent, minus the summary itself
-    // (it is appended separately below). Entries between the parent and the
-    // summary (e.g. labels) are kept — slicing from pIdx+2 would duplicate
-    // the summary whenever it is not the parent's direct child.
-    const mainAfterParent = mainPath
-      .slice(pIdx + 1)
-      .filter((e) => (e.id as string) !== srcId);
+    // Merge segments (shared with the branch-summarize merge): root → parent,
+    // the main-path continuation, the parent's other side branches, and the
+    // off-path subtrees preserved along the way.
+    const { segmentA, mainAfterParent, sideRoots, offPathSubtrees } =
+      computeMergeSegments(allEntries, byId, mainPath, parentId, srcId);
     // The summary's own subtree (branch content after it, off the main path).
-    const srcDescendants = srcOnMain ? [] : collectSubtree(srcId, false);
-    // The parent's other side branches — re-attached under the summary.
-    const sideRoots = parentChildren.filter(
-      (e) => (e.id as string) !== srcId && !mainPathIds.has(e.id as string),
-    );
+    const srcDescendants = srcOnMain
+      ? []
+      : collectOffPathSubtree(byId, allEntries, mainPathIds, srcId, false);
     // When the summary itself is on the main path (srcDescendants is empty
     // then), branches forking off it are preserved too.
     const srcSideRoots = srcOnMain
@@ -895,35 +1090,6 @@ async function handleMerge(
             !mainPathIds.has(c.id as string),
         )
       : [];
-
-    // Off-path subtrees forking off segment-A entries (except the parent,
-    // whose side branches are `sideRoots`) and off the main-path continuation
-    // — preserved in the rebuild so a merge never drops side branches.
-    const mainAll = [...segmentA, ...mainAfterParent];
-    const mainAllIds = new Set(mainAll.map((e) => e.id as string));
-    const offPathSubtrees = new Map<string, Array<Record<string, unknown>>>();
-    for (const e of mainAll) {
-      const kids = allEntries.filter(
-        (c) =>
-          (c.parentId as string | null) === e.id &&
-          !mainAllIds.has(c.id as string),
-      );
-      if (kids.length === 0) continue;
-      const sub: Array<Record<string, unknown>> = [];
-      const walkSub = (id: string) => {
-        for (const c of allEntries.filter(
-          (x) => (x.parentId as string | null) === id,
-        )) {
-          sub.push(c);
-          walkSub(c.id as string);
-        }
-      };
-      for (const k of kids) {
-        sub.push(k);
-        walkSub(k.id as string);
-      }
-      offPathSubtrees.set(e.id as string, sub);
-    }
 
     // Old session handling — same two-step as delete.
     const markChoice = await ctx.ui.select("Delete method", [
@@ -954,68 +1120,34 @@ async function handleMerge(
     await ctx.newSession({
       parentSession: markOld ? undefined : oldParentSession,
       setup: async (sm2) => {
-        const idMap = new Map<string, string>();
-        let lastNewId: string | undefined;
-
-        const appendChain = (entries: Array<Record<string, unknown>>) => {
-          for (const entry of entries) {
-            const newId = appendEntry(sm2, entry);
-            if (newId) {
-              idMap.set(entry.id as string, newId);
-              lastNewId = newId;
-            } else if (lastNewId) {
-              // Pass-through (label / compaction / branch_summary): not
-              // copied, but children attach under the current tail.
-              idMap.set(entry.id as string, lastNewId);
-            }
-          }
-        };
-
-        // root → parent, preserving off-path subtrees of segment-A entries
-        // (the parent's own side branches are re-attached under the summary).
-        appendChain(segmentA);
-        for (const e of segmentA) {
-          if ((e.id as string) === parentId) continue;
-          const sub = offPathSubtrees.get(e.id as string);
-          if (!sub) continue;
-          const parentNewId = idMap.get(e.id as string);
-          if (!parentNewId) continue;
-          sm2.branch(parentNewId);
-          appendChain(sub);
-        }
-
-        const parentNewId = idMap.get(parentId);
-        if (parentNewId) sm2.branch(parentNewId);
-        const srcNewId = appendEntry(sm2, srcEntry);
-
-        // The summary's own continuation (branch content after it).
-        appendChain(srcDescendants);
-
-        // The summary's own side branches (when it sits on the main path).
-        for (const root of srcSideRoots) {
-          sm2.branch(srcNewId);
-          appendChain(collectSubtree(root.id as string, true));
-        }
-
-        // The parent's other side branches, re-attached under the summary.
-        for (const root of sideRoots) {
-          sm2.branch(srcNewId);
-          appendChain(collectSubtree(root.id as string, true));
-        }
-
-        // The main-path continuation, re-attached under the summary; its
-        // off-path subtrees are preserved too.
-        sm2.branch(srcNewId);
-        for (const entry of mainAfterParent) {
-          const newId = appendEntry(sm2, entry);
-          if (!newId) continue;
-          const sub = offPathSubtrees.get(entry.id as string);
-          if (sub) {
-            sm2.branch(newId);
-            appendChain(sub);
-            sm2.branch(newId);
-          }
-        }
+        rebuildMerged(sm2, {
+          segmentA,
+          mainAfterParent,
+          offPathSubtrees,
+          parentId,
+          underMerged: [
+            ...srcDescendants,
+            ...srcSideRoots.flatMap((root) =>
+              collectOffPathSubtree(
+                byId,
+                allEntries,
+                mainPathIds,
+                root.id as string,
+                true,
+              ),
+            ),
+          ],
+          sideSubtrees: sideRoots.map((root) =>
+            collectOffPathSubtree(
+              byId,
+              allEntries,
+              mainPathIds,
+              root.id as string,
+              true,
+            ),
+          ),
+          appendMerged: (sm2) => appendEntry(sm2, srcEntry),
+        });
       },
       withSession: async (freshCtx) => {
         const newSessionFile = freshCtx.sessionManager.getSessionFile();
@@ -1052,6 +1184,331 @@ async function handleMerge(
       },
     });
   } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    ctx.ui.notify(`Merge failed: ${message}`, "error");
+  }
+}
+
+/**
+ * Packaged "distill + merge": summarize a whole side branch and merge the
+ * summary into the fork point — the same result as running /distill on the
+ * branch and then /distill merge on the resulting summary, in one step.
+ *
+ * The label must sit on the FIRST message of a branch (a user message whose
+ * parent is a fork point on the current path — a branch always starts with a
+ * user message, which also guarantees the compressed range never swallows
+ * the parent's turn). The branch must be a single message chain with no
+ * forks; the range runs from the label to the branch end. The generated
+ * summary replaces the branch as the parent's only direct child, with the
+ * parent's other branches and the main-path continuation re-attached under
+ * it (identical topology to handleMerge).
+ */
+async function handleDistillMerge(
+  label: string,
+  ctx: ExtensionCommandContext,
+  config: DistillConfig,
+  startId: string,
+): Promise<void> {
+  try {
+    const sm = ctx.sessionManager;
+    const allEntries = sm.getEntries() as unknown as Array<
+      Record<string, unknown>
+    >;
+    const byId = new Map(allEntries.map((e) => [e.id as string, e]));
+
+    // The target must be the first message of a branch: a user message.
+    const startEntry = byId.get(startId);
+    const startRole = (
+      startEntry as { message?: { role?: string } } | undefined
+    )?.message?.role;
+    if (!startEntry || startEntry.type !== "message" || startRole !== "user") {
+      ctx.ui.notify(
+        "Merge-and-summarize target must be the first user message of a branch.",
+        "warning",
+      );
+      return;
+    }
+
+    // The branch's parent is the fork point — walk through any pass-through
+    // entries (labels etc.) sitting between them.
+    let parentId = startEntry.parentId as string | null;
+    while (
+      parentId &&
+      PASSTHROUGH_TYPES.has(byId.get(parentId)?.type as string)
+    ) {
+      parentId = byId.get(parentId)?.parentId as string | null;
+    }
+    if (!parentId) {
+      ctx.ui.notify("Branch has no parent node.", "warning");
+      return;
+    }
+    const parentChildren = allEntries.filter(
+      (e) => (e.parentId as string | null) === parentId,
+    );
+    if (parentChildren.length <= 1) {
+      ctx.ui.notify(
+        "Parent node has only one branch — nothing to merge.",
+        "warning",
+      );
+      return;
+    }
+
+    // Main path (root → leaf).
+    const leafId = sm.getLeafId();
+    if (!leafId) throw new Error("Cannot determine current leaf node.");
+    const mainPath: Array<Record<string, unknown>> = [];
+    let cur = byId.get(leafId);
+    const seen = new Set<string>();
+    while (cur && !seen.has(cur.id as string)) {
+      seen.add(cur.id as string);
+      mainPath.unshift(cur);
+      const pid = cur.parentId as string | null;
+      if (!pid) break;
+      cur = byId.get(pid);
+    }
+    const mainPathIds = new Set(mainPath.map((e) => e.id as string));
+    if (mainPath.findIndex((e) => (e.id as string) === parentId) === -1) {
+      ctx.ui.notify("Parent node is not on the current path.", "warning");
+      return;
+    }
+    // The branch itself must be off the main path — otherwise there is no
+    // separate branch to merge.
+    if (mainPathIds.has(startId)) {
+      ctx.ui.notify(
+        "The tagged node is on the main path — nothing to merge.",
+        "warning",
+      );
+      return;
+    }
+
+    // Walk the branch's single message chain from the label to its end. A
+    // fork anywhere along it is rejected; the end is the last message with
+    // no message children. Pass-through entries (labels) are transparent.
+    const childrenOf = new Map<string | null, Array<Record<string, unknown>>>();
+    for (const e of allEntries) {
+      const pid = (e.parentId as string | null) ?? null;
+      const list = childrenOf.get(pid);
+      if (list) list.push(e);
+      else childrenOf.set(pid, [e]);
+    }
+    const effectiveMessageChildren = (
+      id: string,
+    ): Array<Record<string, unknown>> => {
+      const direct = childrenOf.get(id) ?? [];
+      const result: Array<Record<string, unknown>> = [];
+      for (const c of direct) {
+        if (c.type === "message") result.push(c);
+        else if (PASSTHROUGH_TYPES.has(c.type as string)) {
+          result.push(...effectiveMessageChildren(c.id as string));
+        }
+      }
+      return result;
+    };
+    let endId = startId;
+    let node: Record<string, unknown> | undefined = startEntry;
+    const walked = new Set<string>();
+    while (node && !walked.has(node.id as string)) {
+      walked.add(node.id as string);
+      const kids = effectiveMessageChildren(node.id as string);
+      if (kids.length > 1) {
+        throw new Error(
+          "Branch detected in range — not supported yet. Distill before/after the branch point separately.",
+        );
+      }
+      if (kids.length === 0) {
+        endId = node.id as string;
+        break;
+      }
+      node = kids[0];
+    }
+
+    // Summarize the branch [label → branch end] (side-branch plan mode).
+    const result = await executeCompact(
+      {
+        startLabel: label,
+        startId,
+        endId,
+        endLabelDesc: "branch end",
+      },
+      config,
+      ctx,
+    );
+    const finalSummary = await showSummaryAndConfirm(result.summary, ctx);
+
+    // Merge segments (shared with handleMerge).
+    const { segmentA, mainAfterParent, sideRoots, offPathSubtrees } =
+      computeMergeSegments(allEntries, byId, mainPath, parentId, startId);
+    // Non-message tail hanging off the branch end (labels, custom entries)
+    // stays with the summary.
+    const underMerged = collectOffPathSubtree(
+      byId,
+      allEntries,
+      mainPathIds,
+      endId,
+      false,
+    );
+
+    // Old session handling — same two-step as delete/merge.
+    const markChoice = await ctx.ui.select("Delete method", [
+      "New session (keep old as distilled)",
+      "In place (no trace)",
+      "Cancel",
+    ]);
+    if (markChoice === undefined || markChoice === "Cancel") return;
+    const markOld = markChoice === "New session (keep old as distilled)";
+
+    const oldSessionFile = sm.getSessionFile();
+    const oldTitle = sm.getSessionName();
+    const sessionDir = sm.getSessionDir();
+    const cwd = ctx.cwd;
+
+    // In-place rebuild keeps the old session's tree position.
+    let oldParentSession: string | undefined;
+    try {
+      oldParentSession = SessionManager.open(
+        oldSessionFile,
+      ).getHeader()?.parentSession;
+    } catch {
+      // Non-fatal: fall back to a root session.
+    }
+
+    await ctx.newSession({
+      parentSession: markOld ? undefined : oldParentSession,
+      setup: async (sm2) => {
+        const summaryContent =
+          `<distilled-summary turns="${result.turnCount}" messages="${result.segmentBC.length}">\n` +
+          `${finalSummary}\n` +
+          `</distilled-summary>`;
+        rebuildMerged(sm2, {
+          segmentA,
+          mainAfterParent,
+          offPathSubtrees,
+          parentId,
+          underMerged,
+          sideSubtrees: sideRoots.map((root) =>
+            collectOffPathSubtree(
+              byId,
+              allEntries,
+              mainPathIds,
+              root.id as string,
+              true,
+            ),
+          ),
+          appendMerged: (sm2) =>
+            sm2.appendMessage({
+              role: "compactionSummary",
+              summary: summaryContent,
+              tokensBefore: estimateTokens(result.segmentBC),
+              timestamp: Date.now(),
+            } as unknown as Parameters<SessionManager["appendMessage"]>[0]),
+        });
+
+        // Archive the original branch content for view_distilled_context.
+        const archiveData = {
+          conversations: result.segmentBC.map((m) => {
+            if (m.type === "message") {
+              const msg = (
+                m as unknown as { message: { role: string; content: unknown } }
+              ).message;
+              return {
+                role: msg.role,
+                content:
+                  typeof msg.content === "string"
+                    ? msg.content
+                    : JSON.stringify(msg.content),
+              };
+            }
+            const ce = m as unknown as { content: unknown };
+            return {
+              role: "distilled_summary",
+              content:
+                typeof ce.content === "string"
+                  ? ce.content
+                  : JSON.stringify(ce.content),
+            };
+          }),
+          range: { startLabel: label },
+          turnCount: result.turnCount,
+          timestamp: Date.now(),
+        };
+        sm2.appendCustomEntry("distilled-archive", archiveData);
+      },
+      withSession: async (freshCtx) => {
+        const newSessionFile = freshCtx.sessionManager.getSessionFile();
+        if (oldSessionFile && newSessionFile) {
+          if (markOld) {
+            if (config.autoClean) {
+              deleteSession(oldSessionFile);
+            } else {
+              await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
+              setParentSession(oldSessionFile, newSessionFile);
+              markDistilledTitle(oldSessionFile, oldTitle);
+            }
+          } else {
+            // In place: remove the old session file — no leftover copy.
+            // Re-parent its children under the fresh session.
+            deleteSession(oldSessionFile);
+            try {
+              const sessions = await SessionManager.list(cwd, sessionDir);
+              for (const s of sessions) {
+                if (s.path === oldSessionFile) continue;
+                if (s.parentSessionPath === oldSessionFile) {
+                  setParentSession(s.path, newSessionFile);
+                }
+              }
+            } catch {
+              // Non-fatal: orphaned children fall back to roots.
+            }
+          }
+        }
+        freshCtx.ui.notify("Branch summarized and merged", "info");
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    ctx.ui.notify(`Merge failed: ${message}`, "error");
+  }
+}
+
+/**
+ * /distill merge entry: a label pointing at an existing distilled summary
+ * merges that summary (handleMerge); a label pointing at a branch's first
+ * user message summarizes the branch and merges it in one step
+ * (handleDistillMerge). Resolves the label once so duplicate tags prompt a
+ * single disambiguation.
+ */
+async function handleMergeOrSummarize(
+  label: string,
+  ctx: ExtensionCommandContext,
+  config: DistillConfig,
+): Promise<void> {
+  try {
+    const range = await resolveRange({ startLabel: label }, ctx);
+    if (!range) return; // user cancelled
+
+    const allEntries = ctx.sessionManager.getEntries() as unknown as Array<
+      Record<string, unknown>
+    >;
+    const entry = allEntries.find((e) => (e.id as string) === range.startId);
+    const role = (
+      entry as { message?: { role?: string } } | undefined
+    )?.message?.role;
+
+    if (entry?.type === "message" && role === "compactionSummary") {
+      await handleMerge(label, ctx, config, range.startId);
+    } else if (entry?.type === "message" && role === "user") {
+      await handleDistillMerge(label, ctx, config, range.startId);
+    } else {
+      ctx.ui.notify(
+        "Merge target must be a distilled summary or the first user message of a branch.",
+        "warning",
+      );
+    }
+  } catch (err) {
+    if (err instanceof SummaryCancelledError) {
+      ctx.ui.notify("Summary generation cancelled", "warning");
+      return;
+    }
     const message = err instanceof Error ? err.message : String(err);
     ctx.ui.notify(`Merge failed: ${message}`, "error");
   }
@@ -1178,13 +1635,15 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
         return;
       }
 
-      // /distill merge [<label>] — merge a side branch's distilled summary
-      // into the main path. With no explicit label, "merge" itself is the
-      // label (a tag named "merge" on a branch summary is merged directly).
+      // /distill merge [<label>] — merge a distilled summary into the main
+      // path, or (when the label points at a branch's first user message)
+      // summarize that branch and merge it in one step. With no explicit
+      // label, "merge" itself is the label (a tag named "merge" is merged
+      // directly).
       const mergeMatch = /^merge(?:\s+(.+))?$/i.exec(trimmed);
       if (mergeMatch) {
         const label = mergeMatch[1]?.trim() ?? "merge";
-        await handleMerge(label, ctx, config);
+        await handleMergeOrSummarize(label, ctx, config);
         return;
       }
 
