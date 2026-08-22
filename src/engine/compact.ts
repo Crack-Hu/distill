@@ -221,15 +221,38 @@ export class SummaryCancelledError extends Error {
   }
 }
 
+// Braille dots: eastAsianWidth() says 1 column, but some terminals/fonts
+// render them 2 columns wide. Count them conservatively as 2 so the box
+// border never overflows and wraps — a 1-column render just leaves one
+// extra space before the right border.
 const SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 
 /**
- * Small overlay shown while the summary is being generated: a spinner line
- * plus the user's configured interrupt key (Esc by default). Aborting closes
- * the overlay with "cancel"; a settled generation closes it with "done"
- * (success or failure — the caller re-awaits the generation to see errors).
+ * Visible width of a (possibly styled) string. Braille dot characters are
+ * counted as 2 columns to stay safe across terminals (see SPINNER_FRAMES).
  */
-class GeneratingNotice implements Component {
+function visibleWidth(s: string): number {
+  const plain = s.replace(/\x1b\[[0-9;]*m/g, "");
+  let w = 0;
+  for (const ch of plain) {
+    const cp = ch.codePointAt(0) ?? 0;
+    w += cp >= 0x2800 && cp <= 0x28ff ? 2 : 1;
+  }
+  return w;
+}
+
+/**
+ * Formal progress dialog shown while the summary is being generated: a top
+ * rule with the title, a spinner line, the model in use (dimmed), and a
+ * footer hint for the cancel key. No left/right borders — instead every row
+ * is padded to the full box width and filled with the panel background, so
+ * the layer below is fully covered regardless of row content. Escape
+ * (tui.select.cancel, honoring user keybinding config) aborts the
+ * generation; a settled generation closes the dialog with "done" (success
+ * or failure — the caller re-awaits to see errors).
+ */
+class DistillProgressDialog implements Component {
+  private static readonly BOX_W = 52;
   private settled = false;
   private frame = 0;
   private ticker: ReturnType<typeof setInterval> | undefined;
@@ -240,6 +263,7 @@ class GeneratingNotice implements Component {
     private readonly theme: Theme,
     private readonly keybindings: KeybindingsManager,
     generation: Promise<unknown>,
+    private readonly modelLabel: string,
     done: (result: "done" | "cancel") => void,
   ) {
     this.finish = (result) => {
@@ -248,7 +272,7 @@ class GeneratingNotice implements Component {
       if (this.ticker) clearInterval(this.ticker);
       done(result);
     };
-    // Close the overlay when the generation settles, success or failure.
+    // Close the dialog when the generation settles, success or failure.
     void generation.then(
       () => this.finish("done"),
       () => this.finish("done"),
@@ -260,19 +284,46 @@ class GeneratingNotice implements Component {
   }
 
   handleInput(data: string): void {
-    // app.interrupt honors the user's keybinding config (Esc by default).
-    if (this.keybindings.matches(data, "app.interrupt")) {
+    // Match the same cancel key pi's select dialogs use (Esc by default).
+    if (this.keybindings.matches(data, "tui.select.cancel")) {
       this.finish("cancel");
     }
   }
 
   render(width: number): string[] {
+    const W = Math.min(width, DistillProgressDialog.BOX_W);
+    const { theme } = this;
+    const border = (s: string) => theme.fg("border", s);
+    const dim = (s: string) => theme.fg("dim", s);
+    const accent = (s: string) => theme.fg("accent", s);
+    // Panel row: right-pad the (possibly styled) line to the full box width,
+    // then fill the whole row with the panel background so the layer below
+    // never shows through between rows (no side borders to do that job).
+    const panel = (styled: string) =>
+      theme.bg(
+        "selectedBg",
+        styled + " ".repeat(Math.max(0, W - visibleWidth(styled))),
+      );
+
+    const title = " Compacting context ";
+    const top = border(
+      `┌─${title}${`─`.repeat(Math.max(0, W - visibleWidth(title) - 4))}─┐`,
+    );
+    const bottom = border(`└${`─`.repeat(W - 2)}┘`);
     const spin = SPINNER_FRAMES[this.frame % SPINNER_FRAMES.length];
-    const key = this.keybindings.getKeys("app.interrupt")?.[0] ?? "esc";
-    const text = `${spin} Generating summary…  (${key} to cancel)`;
-    // Slice the PLAIN text first — slicing styled text would cut the ANSI
-    // escape sequences and corrupt the render.
-    return [this.theme.fg("dim", text.slice(0, width))];
+    const key = this.keybindings.getKeys("tui.select.cancel")?.[0] ?? "esc";
+    const indent = "  ";
+
+    return [
+      panel(top),
+      panel(""),
+      panel(indent + accent(spin) + ` Generating summary…`),
+      panel(""),
+      panel(indent + dim(`Model: ${this.modelLabel}`)),
+      panel(""),
+      panel(indent + dim(`${key} to cancel`)),
+      panel(bottom),
+    ];
   }
 
   invalidate(): void {}
@@ -313,15 +364,28 @@ async function generateSummaryWithCancel(
 
   if (!ctx.hasUI) return generation;
 
+  const modelLabel = `${(model as { provider?: string }).provider ?? "?"}/${
+    (model as { id?: string }).id ?? "?"
+  }`;
   const outcome = await ctx.ui.custom<"done" | "cancel">(
     (tui, theme, keybindings, done) =>
-      new GeneratingNotice(tui, theme, keybindings, generation, done),
+      new DistillProgressDialog(
+        tui,
+        theme,
+        keybindings,
+        generation,
+        modelLabel,
+        done,
+      ),
     {
       overlay: true,
       // Overlays are NOT focused by default (pi only setFocus()es non-overlay
-      // components) — without this the keys go to the editor and the notice
+      // components) — without this the keys go to the editor and the dialog
       // can never see the Esc press.
       onHandle: (handle) => handle.focus(),
+      overlayOptions: {
+        width: DistillProgressDialog.BOX_W,
+      },
     },
   );
 
