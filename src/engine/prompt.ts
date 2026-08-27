@@ -1,6 +1,7 @@
 /**
  * Prompt builder for the distill summary generation.
  * Loads the template from distill-summary-prompt.md at startup.
+ * The optional user supplement is injected via distill-summary-prompt-append.md.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -13,6 +14,7 @@ import type { AnyEntry, MessageEntry } from "./turn-group";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const TEMPLATE_PATH = join(__dirname, "../../distill-summary-prompt.md");
+const APPEND_TEMPLATE_PATH = join(__dirname, "../../distill-summary-prompt-append.md");
 
 const DEFAULT_TEMPLATE = [
   "你是一个上下文压缩助手。请阅读以下对话片段，生成一段精简的摘要。",
@@ -21,6 +23,11 @@ const DEFAULT_TEMPLATE = [
   "",
   "[对话片段]",
   "{{CONVERSATION}}",
+].join("\n");
+
+const DEFAULT_APPEND_TEMPLATE = [
+  "除上述要求，用户额外补充的如下内容：",
+  "{{SUPPLEMENT}}",
 ].join("\n");
 
 function loadTemplate(): string {
@@ -32,6 +39,43 @@ function loadTemplate(): string {
     // fall through to default
   }
   return DEFAULT_TEMPLATE;
+}
+
+function loadAppendTemplate(): string {
+  try {
+    if (existsSync(APPEND_TEMPLATE_PATH)) {
+      return readFileSync(APPEND_TEMPLATE_PATH, "utf8");
+    }
+  } catch {
+    // fall through to default
+  }
+  return DEFAULT_APPEND_TEMPLATE;
+}
+
+/**
+ * Render a template by substituting plain `{{KEY}}` placeholders.
+ *
+ * A placeholder on its own line is replaced by the value; if the value is
+ * empty, the heading line above it is dropped too, so empty sections vanish.
+ * Placeholders inside a line are replaced textually.
+ */
+function renderTemplate(template: string, values: Record<string, string>): string {
+  const lines = template.split("\n");
+  const rendered: string[] = [];
+  for (const line of lines) {
+    const m = /^\s*\{\{(\w+)\}\}\s*$/.exec(line);
+    if (m) {
+      const value = values[m[1]] ?? "";
+      if (value) {
+        rendered.push(value);
+      } else if (rendered.length > 0) {
+        rendered.pop(); // drop the heading line
+      }
+    } else {
+      rendered.push(line.replace(/\{\{(\w+)\}\}/g, (_, key: string) => values[key] ?? ""));
+    }
+  }
+  return rendered.join("\n");
 }
 
 // ---- text extraction helpers ----------------------------------------------
@@ -133,47 +177,29 @@ interface PromptOpts {
 }
 
 /**
- * Build the final prompt by loading the template and substituting plain
- * `{{KEY}}` placeholders (BACKGROUND / CONVERSATION).
- *
- * The template author writes section headings directly in the template, with
- * the placeholder on the line below. If a value is empty, that placeholder
- * line AND the heading line above it are dropped, so empty sections vanish.
- *
- * The user supplement is optional and is appended at the very end by code.
+ * Build the final prompt by rendering the main template (with BACKGROUND /
+ * CONVERSATION placeholders) and, when a supplement is provided, appending
+ * the rendered append template (distill-summary-prompt-append.md) — the
+ * supplement text replaces its {{SUPPLEMENT}} placeholder.
  */
 export function buildSummaryPrompt(opts: PromptOpts): string {
-  const template = loadTemplate();
+  const mainTemplate = loadTemplate();
 
   const values: Record<string, string> = {
     BACKGROUND: (opts.backgroundText ?? "").trim(),
     CONVERSATION: (opts.compressedText ?? "").trim(),
   };
 
-  // Render line by line: a line matching {{KEY}} is replaced by its value;
-  // if the value is empty, drop the heading line above it too.
-  const lines = template.split("\n");
-  const rendered: string[] = [];
-  for (const line of lines) {
-    const m = /^\s*\{\{(\w+)\}\}\s*$/.exec(line);
-    if (m) {
-      const value = values[m[1]] ?? "";
-      if (value) {
-        rendered.push(value);
-      } else if (rendered.length > 0) {
-        rendered.pop(); // drop the heading line
-      }
-    } else {
-      rendered.push(line);
-    }
-  }
+  let out = renderTemplate(mainTemplate, values);
 
-  let out = rendered.join("\n");
-
-  // User supplement is optional; appended last.
+  // User supplement is optional; appended last via the append template.
   const supplement = (opts.supplement ?? "").trim();
   if (supplement) {
-    out += `\n\n在压缩时需要考虑用户额外补充的如下内容：\n${supplement}`;
+    const appendTemplate = loadAppendTemplate();
+    const renderedAppend = renderTemplate(appendTemplate, { SUPPLEMENT: supplement });
+    if (renderedAppend.trim()) {
+      out += `\n\n${renderedAppend}`;
+    }
   }
 
   return out.replace(/\n{3,}/g, "\n\n").trim();

@@ -187,7 +187,7 @@ Step 2  Delete method
 
 ## 摘要 prompt
 
-摘要模板外部化为 `distill-summary-prompt.md`（中文，保证摘要输出中文）。`logs/` 目录会记录每次生成的 prompt，便于调试。
+摘要模板外部化为 `distill-summary-prompt.md`（中文，保证摘要输出中文）。当使用 `/distill <label> [补充]` 传入补充说明时，会额外加载 `distill-summary-prompt-append.md` 模板，将其中的 `{{SUPPLEMENT}}` 占位符替换为用户补充的内容，并拼接在最终 prompt 末尾。两个模板都可直接编辑，代码只负责替换占位符与拼接。`logs/` 目录会记录每次生成的 prompt，便于调试。
 
 `formatMessages` 将对话结构化为 JSON 数组（role: `user` / `assistant` / `tool_result` / `distilled_summary`）交给摘要模型，避免模型臆造对话归属。
 
