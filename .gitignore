@@ -1,16 +1,18 @@
-# 运行时日志（每次压缩的 prompt 记录）
+# 运行时生成物（新版已迁移到 <cwd>/.pi/distill/，这里仅忽略历史遗留）
 logs/
-
-# 本地配置（含用户的模型选择等环境信息）
 config.json
 
 # macOS
 .DS_Store
 
-# 测试脚本依赖链接（指向 pi 安装目录）
+# 测试依赖链接（指向 pi 安装目录）
 node_modules/
-tests/
 
+# 测试生成物与含真实对话的 fixture 不入库；测试代码本身应受版本管理
+tests/output/
+tests/fixtures-real.ts
+tests/_probe.ts
+tests/_probe2.ts
 
 # pi 本地项目配置
 .pi/
