@@ -55,7 +55,7 @@ pi install https://github.com/Crack-Hu/distill
 | `/distill context on\|off` | 摘要生成时是否携带完整上文背景 |
 | `/distill auto-clean on\|off` | 压缩后是否自动删除旧会话（默认 off） |
 | `/distill model` | 选择摘要生成模型（从 pi 已注册模型） |
-| `/distill clean` | 删除所有 `[distilled]` 旧会话 |
+| `/distill clean [all]` | 回收当前项目的 `[distilled]` 旧会话到 trash；加 `all` 回收所有项目 |
 | `/distill fork <path> [message]` | 从蒸馏会话 fork 出新会话继续工作 |
 
 ---
@@ -105,7 +105,7 @@ Step 1  Label "xxx" points to a single entry — delete how?
         - Label to current position    删除标签到当前位置
         - Cancel
 
-Step 2  Delete method
+Step 2  Session method
         - New session (keep old as distilled)   旧会话标记 [distilled]
         - In place (no record)                  不保留旧会话记录
         - Cancel
@@ -198,7 +198,7 @@ Step 2  Delete method
 
 ## 配置
 
-`config.json`（与扩展同目录）：
+`config.json` 位于当前工作目录的 `<cwd>/.pi/distill/config.json`（每个项目独立，首次运行自动创建；旧版本扩展目录下的 `config.json` 会自动迁移）：
 
 ```json
 {
@@ -210,7 +210,7 @@ Step 2  Delete method
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `autoClean` | `false` | 压缩后自动删除旧会话（否则标记 `[distilled]` 保留） |
+| `autoClean` | `false` | 压缩后自动把旧会话移入 trash（否则标记 `[distilled]` 保留） |
 | `summaryModel` | `"inherit"` | 摘要生成模型；`"inherit"` = 使用当前对话模型 |
 | `contextOn` | `false` | 摘要生成时是否携带完整上文背景（否则只取最后 2 条） |
 
@@ -218,9 +218,27 @@ Step 2  Delete method
 
 ---
 
+## 运行时文件（<cwd>/.pi/distill/）
+
+所有运行时产物都写在当前工作目录的 `.pi/distill/` 下，不会污染扩展源码目录：
+
+| 路径 | 内容 |
+|------|------|
+| `config.json` | 项目配置（见上） |
+| `logs/` | 每次摘要生成的完整 prompt（明文，自动只保留最近 10 个） |
+| `trash/` | 被替换/回收的旧会话文件（扩展不提供清空命令；确认无误后可手动删除该目录下文件） |
+
+### 安全删除策略
+
+- 选择 "In place (no record)" 或开启 `auto-clean` 时，旧会话**不会直接删除**，而是移入 `<cwd>/.pi/distill/trash/`——它们从会话树中消失，但仍可恢复
+- `/distill clean` 只回收**当前项目**的 `[distilled]` 会话到该项目 trash；`/distill clean all` 回收**所有项目**的蒸馏会话（各自进入所属项目的 trash）
+- 扩展**不提供清空 trash 的命令**：确认不再需要恢复时，直接删除对应 `.pi/distill/trash/` 目录下的文件即可
+
+---
+
 ## 摘要 prompt
 
-摘要模板外部化为 `distill-summary-prompt.md`（中文，保证摘要输出中文）。当使用 `/distill <label> [补充]` 传入补充说明时，会额外加载 `distill-summary-prompt-append.md` 模板，将其中的 `{{SUPPLEMENT}}` 占位符替换为用户补充的内容，并拼接在最终 prompt 末尾。两个模板都可直接编辑，代码只负责替换占位符与拼接。`logs/` 目录会记录每次生成的 prompt，便于调试。
+摘要模板外部化为 `distill-summary-prompt.md`（中文，保证摘要输出中文）。当使用 `/distill <label> [补充]` 传入补充说明时，会额外加载 `distill-summary-prompt-append.md` 模板，将其中的 `{{SUPPLEMENT}}` 占位符替换为用户补充的内容，并拼接在最终 prompt 末尾。两个模板都可直接编辑，代码只负责替换占位符与拼接。`<cwd>/.pi/distill/logs/` 会记录每次生成的 prompt（只保留最近 10 个），便于调试。
 
 `formatMessages` 将对话结构化为 JSON 数组（role: `user` / `assistant` / `tool_result` / `distilled_summary`）交给摘要模型，避免模型臆造对话归属。
 
@@ -230,5 +248,5 @@ Step 2  Delete method
 
 - **压缩范围含分支点**：第一版不支持，需在分支点前后分别压缩
 - **标签名 "del"**：`/distill del` 单独使用会把 `del` 当作标签名处理，因此名为 `del` 的标签无法通过删除命令触发压缩（语法歧义的取舍）
-- **append-only 模型**：旧会话文件无法物理删除（保留标记或 `autoClean` 删除）
+- **append-only 模型**：旧会话文件不物理删除，而是保留标记或移入 `<cwd>/.pi/distill/trash/`（`/distill clean [all]` 只负责回收，清空需手动删除 trash 文件）
 - **单删第一轮**：树根所在的第一轮不允许单独删除（无前置内容可衔接）
