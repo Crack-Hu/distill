@@ -51,7 +51,7 @@ pi install https://github.com/Crack-Hu/distill
 | `/distill <label> [补充]` | 压缩从标签到当前位置的内容；同名标签标两处时可选压缩两处之间 |
 | `/distill up [补充]` | 向上压缩到上一个蒸馏摘要，若没有则压缩整个分支（要求中间无分支，需确认） |
 | `/distill del <label>` | 删除范围（不生成摘要）；单独 `/distill del` 操作标签 `del` |
-| `/distill merge <label>` | 收拢分支摘要（父节点下多分支时）；单独 `/distill merge` 操作标签 `merge` |
+| `/distill merge [<label>]` | 无标签时自动检测当前分支，压缩并合并到分岔点；有标签时收拢指定分支摘要或标签指向的分支 |
 | `/distill context on\|off` | 摘要生成时是否携带完整上文背景 |
 | `/distill auto-clean on\|off` | 压缩后是否自动删除旧会话（默认 off） |
 | `/distill model` | 选择摘要生成模型（从 pi 已注册模型） |
@@ -107,7 +107,7 @@ Step 1  Label "xxx" points to a single entry — delete how?
 
 Step 2  Delete method
         - New session (keep old as distilled)   旧会话标记 [distilled]
-        - In place (no trace)                   不标记旧会话
+        - In place (no record)                  不保留旧会话记录
         - Cancel
 ```
 
@@ -118,7 +118,18 @@ Step 2  Delete method
 
 ## 分支摘要合并（/distill merge）
 
-处理**分支开头的第一个消息是蒸馏摘要**的情形：
+### 自动模式（无参数）
+
+`/distill merge` 不加参数时，自动检测当前分支：
+
+1. 从 leaf 向上查找第一个分岔点（>1 有效子节点的祖先）
+2. 若分支内无内部分叉（干净链），确认后**压缩 + 合并**一步完成
+3. 若当前路径无分岔点但有前一个蒸馏摘要，退化为纯压缩（同 `/distill up`）
+4. 确认弹窗中显示第一条消息预览
+
+### 标签模式（带参数）
+
+`/distill merge <label>` 处理**分支开头的第一个消息是蒸馏摘要**的情形：
 
 ```
 父节点 P（分叉点）

@@ -131,8 +131,28 @@ async function runCompactAndRebuild(params: RunCompactParams): Promise<void> {
   const sessionDir = ctx.sessionManager.getSessionDir();
   const cwd = ctx.cwd;
 
+  // Capture the old session's parent for in-place replacement.
+  let oldParentSession: string | undefined;
+  try {
+    oldParentSession = SessionManager.open(
+      oldSessionFile,
+    ).getHeader()?.parentSession;
+  } catch {
+    // Non-fatal: fall back to a root session.
+  }
+
+  // Ask the user how to handle the old session (same as delete / merge).
+  const markChoice = await ctx.ui.select("Session method", [
+    "New session (keep old as distilled)",
+    "In place (no record)",
+    "Cancel",
+  ]);
+  if (markChoice === undefined || markChoice === "Cancel") return;
+  const markOld = markChoice === "New session (keep old as distilled)";
+
   // Create replacement session, reconstructing branches from the old tree
   await ctx.newSession({
+    parentSession: markOld ? undefined : oldParentSession ?? undefined,
     setup: async (sm) => {
       const idMap = new Map<string, string>();
       let anchorNewId: string | undefined;
@@ -242,16 +262,31 @@ async function runCompactAndRebuild(params: RunCompactParams): Promise<void> {
       sm.appendCustomEntry("distilled-archive", archiveData);
     },
     withSession: async (freshCtx) => {
-      // Make every older session a flat sibling under the new root, mark the
-      // old title, or delete it when auto-clean is enabled.
       const newSessionFile = freshCtx.sessionManager.getSessionFile();
       if (oldSessionFile && newSessionFile) {
-        if (config.autoClean) {
-          deleteSession(oldSessionFile);
+        if (markOld) {
+          // Keep the old session, marked [distilled] (or auto-clean).
+          if (config.autoClean) {
+            deleteSession(oldSessionFile);
+          } else {
+            await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
+            setParentSession(oldSessionFile, newSessionFile);
+            markDistilledTitle(oldSessionFile, oldTitle);
+          }
         } else {
-          await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
-          setParentSession(oldSessionFile, newSessionFile);
-          markDistilledTitle(oldSessionFile, oldTitle);
+          // In place: rebuild into a fresh session and remove the old file.
+          deleteSession(oldSessionFile);
+          try {
+            const sessions = await SessionManager.list(cwd, sessionDir);
+            for (const s of sessions) {
+              if (s.path === oldSessionFile) continue;
+              if (s.parentSessionPath === oldSessionFile) {
+                setParentSession(s.path, newSessionFile);
+              }
+            }
+          } catch {
+            // Non-fatal: orphaned children fall back to roots.
+          }
         }
       }
       freshCtx.ui.notify("✅ Distilled", "info");
@@ -963,7 +998,7 @@ async function handleDelete(
     // Step 2 — old session handling (both granularities share this).
     const markChoice = await ctx.ui.select("Delete method", [
       "New session (keep old as distilled)",
-      "In place (no trace)",
+      "In place (no record)",
       "Cancel",
     ]);
     if (markChoice === undefined || markChoice === "Cancel") return;
@@ -1309,7 +1344,7 @@ async function handleMerge(
     // Old session handling — same two-step as delete.
     const markChoice = await ctx.ui.select("Delete method", [
       "New session (keep old as distilled)",
-      "In place (no trace)",
+      "In place (no record)",
       "Cancel",
     ]);
     if (markChoice === undefined || markChoice === "Cancel") return;
@@ -1427,6 +1462,8 @@ async function handleDistillMerge(
   ctx: ExtensionCommandContext,
   config: DistillConfig,
   startId: string,
+  /** Pre-resolved end of the range; when omitted, walks to the branch end. */
+  preResolvedEndId?: string,
 ): Promise<void> {
   try {
     const sm = ctx.sessionManager;
@@ -1500,45 +1537,53 @@ async function handleDistillMerge(
       return;
     }
 
-    // Walk the branch's single message chain from the label to its end. A
-    // fork anywhere along it is rejected; the end is the last message with
-    // no message children. Pass-through entries (labels) are transparent.
-    const childrenOf = new Map<string | null, Array<Record<string, unknown>>>();
-    for (const e of allEntries) {
-      const pid = (e.parentId as string | null) ?? null;
-      const list = childrenOf.get(pid);
-      if (list) list.push(e);
-      else childrenOf.set(pid, [e]);
-    }
-    const effectiveMessageChildren = (
-      id: string,
-    ): Array<Record<string, unknown>> => {
-      const direct = childrenOf.get(id) ?? [];
-      const result: Array<Record<string, unknown>> = [];
-      for (const c of direct) {
-        if (c.type === "message") result.push(c);
-        else if (PASSTHROUGH_TYPES.has(c.type as string)) {
-          result.push(...effectiveMessageChildren(c.id as string));
+    // Determine the end of the range: use preResolvedEndId when provided
+    // (auto-merge), otherwise walk the branch's single message chain from
+    // the label to its end. A fork anywhere along it is rejected.
+    let endId: string;
+    if (preResolvedEndId) {
+      endId = preResolvedEndId;
+    } else {
+      const childrenOf = new Map<
+        string | null,
+        Array<Record<string, unknown>>
+      >();
+      for (const e of allEntries) {
+        const pid = (e.parentId as string | null) ?? null;
+        const list = childrenOf.get(pid);
+        if (list) list.push(e);
+        else childrenOf.set(pid, [e]);
+      }
+      const effectiveMessageChildren = (
+        id: string,
+      ): Array<Record<string, unknown>> => {
+        const direct = childrenOf.get(id) ?? [];
+        const result: Array<Record<string, unknown>> = [];
+        for (const c of direct) {
+          if (c.type === "message") result.push(c);
+          else if (PASSTHROUGH_TYPES.has(c.type as string)) {
+            result.push(...effectiveMessageChildren(c.id as string));
+          }
         }
+        return result;
+      };
+      endId = startId;
+      let node: Record<string, unknown> | undefined = startEntry;
+      const walked = new Set<string>();
+      while (node && !walked.has(node.id as string)) {
+        walked.add(node.id as string);
+        const kids = effectiveMessageChildren(node.id as string);
+        if (kids.length > 1) {
+          throw new Error(
+            "Branch detected in range — not supported yet. Distill before/after the branch point separately.",
+          );
+        }
+        if (kids.length === 0) {
+          endId = node.id as string;
+          break;
+        }
+        node = kids[0];
       }
-      return result;
-    };
-    let endId = startId;
-    let node: Record<string, unknown> | undefined = startEntry;
-    const walked = new Set<string>();
-    while (node && !walked.has(node.id as string)) {
-      walked.add(node.id as string);
-      const kids = effectiveMessageChildren(node.id as string);
-      if (kids.length > 1) {
-        throw new Error(
-          "Branch detected in range — not supported yet. Distill before/after the branch point separately.",
-        );
-      }
-      if (kids.length === 0) {
-        endId = node.id as string;
-        break;
-      }
-      node = kids[0];
     }
 
     // Summarize the branch [label → branch end] (side-branch plan mode).
@@ -1570,7 +1615,7 @@ async function handleDistillMerge(
     // Old session handling — same two-step as delete/merge.
     const markChoice = await ctx.ui.select("Delete method", [
       "New session (keep old as distilled)",
-      "In place (no trace)",
+      "In place (no record)",
       "Cancel",
     ]);
     if (markChoice === undefined || markChoice === "Cancel") return;
@@ -1744,6 +1789,7 @@ async function handleMergeOrSummarize(
  */
 export function findCleanBranchRange(
   ctx: ExtensionCommandContext,
+  opts?: { ignoreSummaries?: boolean },
 ):
   | {
       summaryId: string | null;
@@ -1837,8 +1883,10 @@ export function findCleanBranchRange(
   for (let i = path.length - 1; i >= 0; i--) {
     const e = path[i];
 
-    // Check for compactionSummary (skip if it's the leaf itself).
+    // Check for compactionSummary (skip if it's the leaf itself, or when
+    // ignoreSummaries is set for merge mode).
     if (
+      !opts?.ignoreSummaries &&
       i !== path.length - 1 &&
       e.type === "message" &&
       (e as unknown as { message?: { role?: string } }).message?.role ===
@@ -1897,6 +1945,10 @@ export function findCleanBranchRange(
   }
 
   if (forkCount === 0) {
+    if (opts?.ignoreSummaries) {
+      // Merge mode with no fork: fall back to compress-only (up mode).
+      return findCleanBranchRange(ctx, { ignoreSummaries: false });
+    }
     return {
       error:
         "No previous distilled summary found on the current branch, and the branch is a single chain (no fork point). " +
@@ -1941,13 +1993,14 @@ async function handleUp(
       return;
     }
 
-    // Build a preview of the first message (truncated).
-    const preview = found.firstMessage
-      ? ` (${truncate(found.firstMessage, 40)})`
-      : "";
+    // Build a two-line confirmation option: main text + gray preview.
     const kind = found.summaryId
       ? "since the previous summary"
       : "on this branch";
+    const dim = (s: string) => ctx.ui.theme.fg("dim", s);
+    const preview = found.firstMessage
+      ? `\n${dim(`  ↳ ${truncate(found.firstMessage.replace(/\n/g, " "), 50)}`)}`
+      : "";
     const options = [
       `Compress the ${found.messageCount} message(s) ${kind}${preview}`,
       "Cancel",
@@ -1967,6 +2020,90 @@ async function handleUp(
       ctx,
     });
   } catch (err) {
+    reportDistillError(ctx, err);
+  }
+}
+
+/**
+ * `/distill merge` (no args): auto-detect the current branch, compress it,
+ * and merge the summary into the fork point (topology: summary becomes the
+ * fork point's only child, other branches re-attached under it).
+ *
+ * Falls back to compress-only (like `/distill up`) when no fork point exists
+ * but a previous summary was found.
+ */
+async function handleMergeAuto(
+  supplement: string | undefined,
+  ctx: ExtensionCommandContext,
+  config: DistillConfig,
+): Promise<void> {
+  try {
+    // Phase 1: find the branch (ignore summaries, only look for fork point).
+    const found = findCleanBranchRange(ctx, { ignoreSummaries: true });
+    if ("error" in found) {
+      ctx.ui.notify(found.error, "warning");
+      return;
+    }
+
+    // If the result came from the fallback (no fork, but has a summary),
+    // we just compress — no merge topology to rearrange.
+    if (found.summaryId !== null) {
+      // Fallback to compress-only (same as `up`).
+      const dim = (s: string) => ctx.ui.theme.fg("dim", s);
+      const preview = found.firstMessage
+        ? `\n${dim(`  ↳ ${truncate(found.firstMessage.replace(/\n/g, " "), 50)}`)}`
+        : "";
+      const options = [
+        `Compress the ${found.messageCount} message(s) since the previous summary${preview}`,
+        "Cancel",
+      ];
+      const choice = await ctx.ui.select(
+        "No branch to merge — compress only?",
+        options,
+      );
+      if (choice === undefined || choice === options[1]) return;
+
+      await runCompactAndRebuild({
+        startLabel: "[merge] previous summary",
+        startId: found.startId,
+        endId: found.endId,
+        supplement,
+        config,
+        ctx,
+      });
+      return;
+    }
+
+    // Phase 2: we have a fork point — confirm and do the full merge.
+    const dim = (s: string) => ctx.ui.theme.fg("dim", s);
+    const preview = found.firstMessage
+      ? `\n${dim(`  ↳ ${truncate(found.firstMessage.replace(/\n/g, " "), 50)}`)}`
+      : "";
+    const options = [
+      `Compress and merge the ${found.messageCount} message(s) on this branch${preview}`,
+      "Cancel",
+    ];
+    const choice = await ctx.ui.select(
+      "Merge the current branch into the fork point?",
+      options,
+    );
+    if (choice === undefined || choice === options[1]) return;
+
+    // Execute the full distill + merge (same as handleDistillMerge).
+    // Pass the pre-resolved endId so the range stops at the current leaf,
+    // not at the end of the branch.
+    await handleDistillMerge(
+      "[merge] auto",
+      ctx,
+      config,
+      found.startId,
+      found.endId,
+    );
+  } catch (err) {
+    if (err instanceof SummaryCancelledError) {
+      ctx.ui.notify("Summary generation cancelled", "warning");
+      return;
+    }
     reportDistillError(ctx, err);
   }
 }
@@ -1999,7 +2136,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
 
   pi.registerCommand("distill", {
     description:
-      "Context distill: /distill <label> [supplement] (tag both ends of a range with the same name); /distill up [supplement] compresses back to the previous summary or the whole branch; /distill del [<label>] deletes a range; /distill merge [<label>] folds sibling branches under a branch summary",
+      "Context distill: /distill <label> [supplement] (tag both ends of a range with the same name); /distill up [supplement] compresses back to the previous summary or the whole branch; /distill del [<label>] deletes a range; /distill merge [<label>] folds sibling branches under a branch summary (auto-detect when no label)",
     getArgumentCompletions: (argumentPrefix) => {
       const prefix = argumentPrefix.trim().toLowerCase();
       if (!prefix) return subcommandCompletions;
@@ -2103,13 +2240,16 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
 
       // /distill merge [<label>] — merge a distilled summary into the main
       // path, or (when the label points at a branch's first user message)
-      // summarize that branch and merge it in one step. With no explicit
-      // label, "merge" itself is the label (a tag named "merge" is merged
-      // directly).
+      // summarize that branch and merge it in one step. With no label,
+      // auto-detect the current branch and merge it.
       const mergeMatch = /^merge(?:\s+(.+))?$/i.exec(trimmed);
       if (mergeMatch) {
-        const label = mergeMatch[1]?.trim() ?? "merge";
-        await handleMergeOrSummarize(label, ctx, config);
+        const label = mergeMatch[1]?.trim();
+        if (label) {
+          await handleMergeOrSummarize(label, ctx, config);
+        } else {
+          await handleMergeAuto(undefined, ctx, config);
+        }
         return;
       }
 
@@ -2122,6 +2262,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
           "Usage: /distill <label> [supplement]  (tag both ends of a range with the same name)\n" +
             "  /distill up [supplement]  compress back to the previous summary or the whole branch\n" +
             "  /distill del <label>  deletes the range without summarizing\n" +
+            "  /distill merge [<label>]  auto-detect current branch and merge (no label) or merge by label\n" +
             "Sub-commands: up  /  context on|off  /  auto-clean on|off  /  model  /  clean",
           "warning",
         );
