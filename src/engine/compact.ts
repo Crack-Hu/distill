@@ -13,31 +13,33 @@ import type {
   Theme,
   TUI,
 } from "@earendil-works/pi-tui";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import {
   buildPath,
+  buildRootPath,
+  collectOffPathSubtree,
   groupPathIntoTurns,
   PASSTHROUGH_TYPES,
   resolveLabel,
 } from "./turn-group";
 import type { AnyEntry } from "./turn-group";
 import { buildSummaryPrompt, formatMessages } from "./prompt";
+import { LOG_KEEP, logDirFor } from "./session-io";
 
 // ---- prompt logging -------------------------------------------------------
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const LOG_DIR = join(__dirname, "../../logs");
-
-/** Write the generated prompt to a timestamped file for debugging. */
-function logPrompt(prompt: string, modelLabel: string): void {
+/**
+ * Write the generated prompt to `<cwd>/.pi/distill/logs/distill-<ts>.txt` and
+ * prune old logs, keeping only the most recent LOG_KEEP files.
+ */
+function logPrompt(prompt: string, modelLabel: string, cwd: string): void {
   try {
-    mkdirSync(LOG_DIR, { recursive: true });
+    const dir = logDirFor(cwd);
+    mkdirSync(dir, { recursive: true });
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    const file = join(LOG_DIR, `distill-${ts}.txt`);
+    const file = join(dir, `distill-${ts}.txt`);
     const header = [
       "# Distill prompt log",
       `time: ${new Date().toISOString()}`,
@@ -45,6 +47,19 @@ function logPrompt(prompt: string, modelLabel: string): void {
       "",
     ].join("\n");
     writeFileSync(file, `${header}\n${prompt}\n`);
+
+    // Prune oldest logs beyond the retention limit (lexicographic order of
+    // the timestamped names matches chronological order).
+    const files = readdirSync(dir)
+      .filter((f) => f.startsWith("distill-") && f.endsWith(".txt"))
+      .sort();
+    for (const old of files.slice(0, Math.max(0, files.length - LOG_KEEP))) {
+      try {
+        rmSync(join(dir, old));
+      } catch {
+        // best-effort
+      }
+    }
   } catch {
     // Logging is best-effort; never fail the distill flow.
   }
@@ -139,49 +154,22 @@ export function collectBranches(
     fullPath.slice(0, endIdx + 1).map((e) => e.id as string),
   );
 
-  // Walk each entry's children to find off-path branches.
-  // We use all entries (not just messages) to preserve labels, model changes etc.
-  function walkDescendants(startId: string): Array<Record<string, unknown>> {
-    const collected: Array<Record<string, unknown>> = [];
-    const directChildren = allEntries.filter(
-      (e) => (e.parentId as string | null) === startId && !fullPathIds.has(e.id as string),
-    );
-    for (const child of directChildren) {
-      collected.push(child);
-      collected.push(...walkDescendants(child.id as string));
-    }
-    return collected;
-  }
-
+  // Collect each fork point's off-path subtree (all entry types — labels,
+  // model changes etc. are preserved alongside messages).
   for (const id of eligibleIds) {
-    const branchEntries = walkDescendants(id);
+    const branchEntries = collectOffPathSubtree(
+      byId,
+      allEntries,
+      fullPathIds,
+      id,
+      false,
+    );
     if (branchEntries.length > 0) {
       result.push({ branchPointId: id, entries: branchEntries });
     }
   }
 
   return result;
-}
-
-/**
- * Walk from `endId` up to root (following parentId), returning chronological
- * order (root → endId).
- */
-function buildFullPath(
-  byId: Map<string, Record<string, unknown>>,
-  endId: string,
-): Array<Record<string, unknown>> {
-  const reversed: Array<Record<string, unknown>> = [];
-  let cur = byId.get(endId);
-  const seen = new Set<string>();
-  while (cur && !seen.has(cur.id as string)) {
-    seen.add(cur.id as string);
-    reversed.push(cur);
-    const pid = cur.parentId as string | null;
-    if (!pid) break;
-    cur = byId.get(pid);
-  }
-  return reversed.reverse();
 }
 
 /**
@@ -194,7 +182,7 @@ function getBackgroundMessages(
   endId: string,
   contextOn: boolean,
 ): AnyEntry[] {
-  const chrono = buildFullPath(byId, endId);
+  const chrono = buildRootPath(byId, endId);
 
   // Find position of startId
   const startIdx = chrono.findIndex((e) => (e.id as string) === startId);
@@ -355,6 +343,7 @@ async function generateSummaryWithCancel(
     backgroundMessages,
     supplement,
     contextOn,
+    ctx.cwd,
     model,
     apiKey,
     headers,
@@ -404,6 +393,7 @@ async function generateSummary(
   backgroundMessages: AnyEntry[],
   supplement: string | undefined,
   contextOn: boolean,
+  cwd: string,
   model: Parameters<typeof complete>[0],
   apiKey: string,
   headers: Record<string, string> | undefined,
@@ -422,9 +412,9 @@ async function generateSummary(
     contextOn,
   });
 
-  // Log the exact prompt sent to the LLM for debugging.
+  // Log the exact prompt sent to the LLM for debugging (project-local dir).
   const modelLabel = `${(model as { provider?: string }).provider ?? "?"}/${(model as { id?: string }).id ?? "?"}`;
-  logPrompt(prompt, modelLabel);
+  logPrompt(prompt, modelLabel, cwd);
 
   const response = await complete(
     model,
@@ -600,11 +590,7 @@ export async function executeCompact(
   }
 
   // Ensure start and end are on the same branch
-  const pathCheck = buildPath(
-    byId as unknown as Map<string, AnyEntry>,
-    startId,
-    endId,
-  );
+  const pathCheck = buildPath(byId, startId, endId);
   if (pathCheck.length === 0) {
     throw new Error(
       `Labels "${range.startLabel}" and "${endLabelDesc}" are not on the same path.`,
@@ -613,7 +599,7 @@ export async function executeCompact(
 
   // Build the FULL path from root → current leaf.
   const leafId = sm.getLeafId();
-  const fullPath = buildFullPath(byId, leafId);
+  const fullPath = buildRootPath(byId, leafId);
   const fullPathIds = new Set(fullPath.map((e) => e.id as string));
 
   // Snap an id to the nearest message entry on a given path.
@@ -656,7 +642,7 @@ export async function executeCompact(
 
   if (offMainPath) {
     // ---- side-branch range ----
-    const branchPath = buildFullPath(byId, endId);
+    const branchPath = buildRootPath(byId, endId);
     effectiveStartId = snapToMessageOn(branchPath, startId, "forward");
     effectiveEndId = snapToMessageOn(branchPath, endId, "backward");
 
