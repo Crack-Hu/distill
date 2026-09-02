@@ -174,23 +174,93 @@ export function resolveAllLabels(
 // ---- path building --------------------------------------------------------
 
 /**
+ * Walk the parentId chain from `leafId` up to the root, returning entries in
+ * chronological order (root → leaf).
+ */
+export function buildRootPath(
+  byId: Map<string, Record<string, unknown>>,
+  leafId: string,
+): Array<Record<string, unknown>> {
+  const path: Array<Record<string, unknown>> = [];
+  let cur = byId.get(leafId);
+  const seen = new Set<string>();
+  while (cur && !seen.has(cur.id as string)) {
+    seen.add(cur.id as string);
+    path.unshift(cur);
+    const pid = cur.parentId as string | null;
+    cur = pid ? byId.get(pid) : undefined;
+  }
+  return path;
+}
+
+/**
+ * Children of `id` that are messages, walking through pass-through entries
+ * (labels, pi-native compaction / branch_summary) transparently.
+ */
+export function effectiveMessageChildren(
+  childrenOf: Map<string | null, Array<Record<string, unknown>>>,
+  id: string,
+): Array<Record<string, unknown>> {
+  const direct = childrenOf.get(id) ?? [];
+  const result: Array<Record<string, unknown>> = [];
+  for (const c of direct) {
+    if (c.type === "message") result.push(c);
+    else if (PASSTHROUGH_TYPES.has(c.type as string)) {
+      result.push(...effectiveMessageChildren(childrenOf, c.id as string));
+    }
+  }
+  return result;
+}
+
+/**
+ * Flatten a node's off-path subtree in pre-order (the node itself included
+ * when `includeRoot` is set). Entries whose id is in `excludeIds` are treated
+ * as on-path and skipped with their descendants. Pass-through entries are
+ * included — rebuilds drop them while keeping their children attached under
+ * the same parent.
+ */
+export function collectOffPathSubtree(
+  byId: Map<string, Record<string, unknown>>,
+  allEntries: Array<Record<string, unknown>>,
+  excludeIds: Set<string>,
+  rootId: string,
+  includeRoot: boolean,
+): Array<Record<string, unknown>> {
+  const result: Array<Record<string, unknown>> = [];
+  const walk = (id: string, first: boolean) => {
+    const node = byId.get(id);
+    if (!node) return;
+    if (!first || includeRoot) result.push(node);
+    for (const child of allEntries.filter(
+      (e) =>
+        (e.parentId as string | null) === id &&
+        !excludeIds.has(e.id as string),
+    )) {
+      walk(child.id as string, false);
+    }
+  };
+  walk(rootId, true);
+  return result;
+}
+
+/**
  * Walk parentId chain from `endId` up to (and including) `startId`.
  * Returns entries in chronological order (root → leaf).
  */
 export function buildPath(
-  byId: Map<string, AnyEntry>,
+  byId: Map<string, Record<string, unknown>>,
   startId: string,
   endId: string,
-): AnyEntry[] {
-  const path: AnyEntry[] = [];
+): Array<Record<string, unknown>> {
+  const path: Array<Record<string, unknown>> = [];
   let current = byId.get(endId);
   const visited = new Set<string>();
 
-  while (current && !visited.has(current.id)) {
-    visited.add(current.id);
-    path.unshift(current); // prepend for chronological order
-    if (current.id === startId) break;
-    current = byId.get(current.parentId ?? "");
+  while (current && !visited.has(current.id as string)) {
+    visited.add(current.id as string);
+    path.unshift(current);
+    if ((current.id as string) === startId) break;
+    current = byId.get((current.parentId as string | null) ?? "");
   }
 
   return path;
