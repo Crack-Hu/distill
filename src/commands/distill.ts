@@ -68,6 +68,197 @@ async function showSummaryAndConfirm(
   return result;
 }
 
+// ---- shared distill flow --------------------------------------------------
+
+interface RunCompactParams {
+  startLabel: string;
+  startId: string;
+  endId: string;
+  endLabelDesc?: string;
+  supplement?: string;
+  config: DistillConfig;
+  ctx: ExtensionCommandContext;
+}
+
+/** Report a distill-flow error, canonicalizing the user-cancel case. */
+function reportDistillError(
+  ctx: ExtensionCommandContext,
+  err: unknown,
+): void {
+  if (err instanceof SummaryCancelledError) {
+    ctx.ui.notify("Summary generation cancelled", "warning");
+    return;
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  ctx.ui.notify(`Distill failed: ${message}`, "error");
+}
+
+/**
+ * Runs the compact engine, shows the summary for confirmation, and rebuilds
+ * the session. Shared by the label-based flow and `/distill auto`.
+ */
+async function runCompactAndRebuild(params: RunCompactParams): Promise<void> {
+  const {
+    startLabel,
+    startId,
+    endId,
+    endLabelDesc,
+    supplement,
+    config,
+    ctx,
+  } = params;
+
+  // Run compact engine
+  const result = await executeCompact(
+    {
+      startLabel,
+      startId,
+      endId,
+      endLabelDesc,
+      supplement,
+    },
+    config,
+    ctx,
+  );
+
+  // Show summary and confirm
+  const finalSummary = await showSummaryAndConfirm(result.summary, ctx);
+
+  // Capture old session metadata before creating the replacement
+  const oldSessionFile = ctx.sessionManager.getSessionFile();
+  const oldTitle = ctx.sessionManager.getSessionName();
+  const oldLeafId = ctx.sessionManager.getLeafId();
+  const sessionDir = ctx.sessionManager.getSessionDir();
+  const cwd = ctx.cwd;
+
+  // Create replacement session, reconstructing branches from the old tree
+  await ctx.newSession({
+    setup: async (sm) => {
+      const idMap = new Map<string, string>();
+      let anchorNewId: string | undefined;
+
+      // Shared archive payload (kept out of the LLM context; used by the
+      // view tool to look up original messages).
+      const archiveData = {
+        conversations: result.segmentBC.map((m) => {
+          if (m.type === "message") {
+            const msg = (m as unknown as { message: { role: string; content: unknown } }).message;
+            return {
+              role: msg.role,
+              content:
+                typeof msg.content === "string"
+                  ? msg.content
+                  : JSON.stringify(msg.content),
+            };
+          }
+          const ce = m as unknown as { content: unknown };
+          return {
+            role: "distilled_summary",
+            content:
+              typeof ce.content === "string"
+                ? ce.content
+                : JSON.stringify(ce.content),
+          };
+        }),
+        range: {
+          startLabel,
+        },
+        turnCount: result.turnCount,
+        timestamp: Date.now(),
+      };
+
+      // Side-branch range: whole-tree rebuild plan. Every entry is copied in
+      // DFS order under its remapped parent; the range is replaced by a fresh
+      // compactionSummary and the range's descendants re-attached under it.
+      if (result.plan) {
+        const summaryContent =
+          `<distilled-summary turns="${result.turnCount}" messages="${result.segmentBC.length}">\n` +
+          `${finalSummary}\n` +
+          `</distilled-summary>`;
+        // Restore the user's position: the plan replay ends at the last DFS
+        // entry, which is not necessarily the original leaf.
+        rebuildPlanEntries(
+          sm,
+          result.plan,
+          summaryContent,
+          estimateTokens(result.segmentBC),
+          oldLeafId ?? undefined,
+        );
+        sm.appendCustomEntry("distilled-archive", archiveData);
+        return;
+      }
+
+      // Copy segment A (all entry types) linearly
+      for (const entry of result.segmentA) {
+        const newId = appendEntry(sm, entry);
+        if (newId) {
+          idMap.set(entry.id as string, newId);
+          anchorNewId = newId;
+        } else if (anchorNewId) {
+          // Pass-through entry (label / compaction / branch_summary): not
+          // copied, but branches forking off it attach under the current
+          // anchor.
+          idMap.set(entry.id as string, anchorNewId);
+        }
+      }
+
+      // Reconstruct branches that fork off segment A
+      for (const branch of result.branches) {
+        const parentNewId = idMap.get(branch.branchPointId);
+        if (!parentNewId) continue;
+        sm.branch(parentNewId);
+        for (const entry of branch.entries) {
+          appendEntry(sm, entry);
+        }
+      }
+
+      // Return to the anchor (last entry before compressed range)
+      if (anchorNewId) sm.branch(anchorNewId);
+
+      // Insert the distilled summary as a native compactionSummary message (a
+      // top-level message, NOT a custom_message). This makes it a node you can
+      // continue from: the tree selector keeps the leaf ON this entry, whereas
+      // custom_message entries move the leaf to the parent and stuff the
+      // content into the editor. The <distilled-summary> tag tells the LLM
+      // this is NOT a user message; turns/messages attrs convey the
+      // compression granularity.
+      const summaryContent =
+        `<distilled-summary turns="${result.turnCount}" messages="${result.segmentBC.length}">\n` +
+        `${finalSummary}\n` +
+        `</distilled-summary>`;
+      sm.appendMessage({
+        role: "compactionSummary",
+        summary: summaryContent,
+        tokensBefore: estimateTokens(result.segmentBC),
+        timestamp: Date.now(),
+      } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+
+      // Copy segment D (all entry types)
+      for (const entry of result.segmentD) {
+        appendEntry(sm, entry);
+      }
+
+      // Insert archive (not in LLM context, for the view tool)
+      sm.appendCustomEntry("distilled-archive", archiveData);
+    },
+    withSession: async (freshCtx) => {
+      // Make every older session a flat sibling under the new root, mark the
+      // old title, or delete it when auto-clean is enabled.
+      const newSessionFile = freshCtx.sessionManager.getSessionFile();
+      if (oldSessionFile && newSessionFile) {
+        if (config.autoClean) {
+          deleteSession(oldSessionFile);
+        } else {
+          await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
+          setParentSession(oldSessionFile, newSessionFile);
+          markDistilledTitle(oldSessionFile, oldTitle);
+        }
+      }
+      freshCtx.ui.notify("✅ Distilled", "info");
+    },
+  });
+}
+
 // ---- session rebuild helpers ---------------------------------------------
 
 /**
@@ -1542,6 +1733,244 @@ async function handleMergeOrSummarize(
   }
 }
 
+// ---- /distill up ------------------------------------------------------------
+
+/**
+ * Scan the current branch (root → leaf) backwards from the leaf for the
+ * nearest distilled summary. If the chain from that summary up to the leaf is
+ * clean (every node has exactly one effective message child, with labels /
+ * pi-native compaction entries treated as pass-through), return the range to
+ * compress: startId = first message after the summary, endId = leaf.
+ */
+export function findCleanBranchRange(
+  ctx: ExtensionCommandContext,
+):
+  | {
+      summaryId: string | null;
+      startId: string;
+      endId: string;
+      messageCount: number;
+      firstMessage: string;
+    }
+  | { error: string } {
+  const sm = ctx.sessionManager;
+  const allEntries = sm.getEntries() as unknown as Array<
+    Record<string, unknown>
+  >;
+  const byId = new Map(allEntries.map((e) => [e.id as string, e]));
+
+  const leafId = sm.getLeafId();
+  if (!leafId) return { error: "Cannot determine current leaf node." };
+
+  // Build path root → leaf.
+  const path: Array<Record<string, unknown>> = [];
+  let cur = byId.get(leafId);
+  const seen = new Set<string>();
+  while (cur && !seen.has(cur.id as string)) {
+    seen.add(cur.id as string);
+    path.unshift(cur);
+    const pid = cur.parentId as string | null;
+    cur = pid ? byId.get(pid) : undefined;
+  }
+
+  // Build children index and effective-message-children helper.
+  const childrenOf = new Map<string | null, Array<Record<string, unknown>>>();
+  for (const e of allEntries) {
+    const pid = (e.parentId as string | null) ?? null;
+    const list = childrenOf.get(pid);
+    if (list) list.push(e);
+    else childrenOf.set(pid, [e]);
+  }
+  const effectiveMessageChildren = (
+    id: string,
+  ): Array<Record<string, unknown>> => {
+    const direct = childrenOf.get(id) ?? [];
+    const result: Array<Record<string, unknown>> = [];
+    for (const c of direct) {
+      if (c.type === "message") result.push(c);
+      else if (PASSTHROUGH_TYPES.has(c.type as string)) {
+        result.push(...effectiveMessageChildren(c.id as string));
+      }
+    }
+    return result;
+  };
+
+  /**
+   * Count messages from `startIdx` (inclusive) to the leaf, and return the
+   * first message's text (truncated) for the confirmation preview.
+   */
+  const countAndPreview = (
+    startIdx: number,
+  ): { startId: string; messageCount: number; firstMessage: string } | null => {
+    let startId: string | null = null;
+    let messageCount = 0;
+    let firstMessage = "";
+    for (let i = startIdx; i < path.length; i++) {
+      if (path[i].type === "message") {
+        if (startId === null) {
+          startId = path[i].id as string;
+          firstMessage = extractMessageText(
+            (path[i] as unknown as { message?: { content?: unknown } })
+              .message?.content,
+          ).trim();
+        }
+        messageCount++;
+      }
+    }
+    if (startId === null) return null;
+    return { startId, messageCount, firstMessage };
+  };
+
+  // ---- Single-pass from leaf up: count forks, find nearest summary --------
+  //
+  // Walk from leaf to root.  If we encounter a compactionSummary first, it's
+  // the upper bound (Case A).  If we encounter a fork (>1 effective children)
+  // first, it's the branch origin (Case B).  If we encounter multiple forks
+  // before any summary, the first one (nearest leaf) is inside the branch →
+  // reject.  If we find a summary and then a fork further up, the fork is
+  // above the range and irrelevant.
+
+  let summaryIdx = -1;
+  let forkIdx = -1;
+  let forkCount = 0;
+
+  for (let i = path.length - 1; i >= 0; i--) {
+    const e = path[i];
+
+    // Check for compactionSummary (skip if it's the leaf itself).
+    if (
+      i !== path.length - 1 &&
+      e.type === "message" &&
+      (e as unknown as { message?: { role?: string } }).message?.role ===
+        "compactionSummary"
+    ) {
+      if (forkCount > 0) {
+        return {
+          error:
+            "Branch detected between the previous summary and the current position. " +
+            "Distill a shorter range manually with labels instead.",
+        };
+      }
+      summaryIdx = i;
+
+      const info = countAndPreview(i + 1);
+      if (!info) {
+        return {
+          error:
+            "Nothing to compress after the previous summary.",
+        };
+      }
+
+      return {
+        summaryId: e.id as string,
+        startId: info.startId,
+        endId: leafId,
+        messageCount: info.messageCount,
+        firstMessage: info.firstMessage,
+      };
+    }
+
+    // Check for fork.
+    const kids = effectiveMessageChildren(e.id as string);
+    if (kids.length > 1) {
+      if (summaryIdx !== -1) {
+        // Fork above the summary — not in the range, ignore.
+        continue;
+      }
+      forkCount++;
+      if (forkCount > 1) {
+        return {
+          error:
+            "Branch detected on the current branch. " +
+            "Distill a shorter range manually with labels instead.",
+        };
+      }
+      forkIdx = i;
+    }
+  }
+
+  // ---- Post-loop: handle results ------------------------------------------
+
+  if (summaryIdx !== -1) {
+    // Handled inside the loop (Case A).
+    throw new Error("unreachable");
+  }
+
+  if (forkCount === 0) {
+    return {
+      error:
+        "No previous distilled summary found on the current branch, and the branch is a single chain (no fork point). " +
+        "Tag both ends with /tree → shift+L and run /distill <label> instead.",
+    };
+  }
+
+  // forkCount === 1: compress the whole branch from the fork's child.
+  const branchStartIdx = forkIdx + 1;
+  if (branchStartIdx >= path.length) {
+    return { error: "Nothing to compress on this branch." };
+  }
+
+  const info = countAndPreview(branchStartIdx);
+  if (!info) {
+    return { error: "Nothing to compress on this branch." };
+  }
+
+  return {
+    summaryId: null,
+    startId: info.startId,
+    endId: leafId,
+    messageCount: info.messageCount,
+    firstMessage: info.firstMessage,
+  };
+}
+
+/**
+ * `/distill up [supplement]`: find the previous distilled summary on the
+ * current branch (or the whole branch if no summary exists), ask for
+ * confirmation showing the first message preview, and compress that range.
+ */
+async function handleUp(
+  supplement: string | undefined,
+  ctx: ExtensionCommandContext,
+  config: DistillConfig,
+): Promise<void> {
+  try {
+    const found = findCleanBranchRange(ctx);
+    if ("error" in found) {
+      ctx.ui.notify(found.error, "warning");
+      return;
+    }
+
+    // Build a preview of the first message (truncated).
+    const preview = found.firstMessage
+      ? ` (${truncate(found.firstMessage, 40)})`
+      : "";
+    const kind = found.summaryId
+      ? "since the previous summary"
+      : "on this branch";
+    const options = [
+      `Compress the ${found.messageCount} message(s) ${kind}${preview}`,
+      "Cancel",
+    ];
+    const choice = await ctx.ui.select(
+      "Distill the current branch up to the previous summary?",
+      options,
+    );
+    if (choice === undefined || choice === options[1]) return; // user cancelled
+
+    await runCompactAndRebuild({
+      startLabel: found.summaryId ? "[up] previous summary" : "[up] branch start",
+      startId: found.startId,
+      endId: found.endId,
+      supplement,
+      config,
+      ctx,
+    });
+  } catch (err) {
+    reportDistillError(ctx, err);
+  }
+}
+
 /** Path of a freshly forked session awaiting its first new user message. */
 let pendingForkSession: string | undefined;
 
@@ -1559,6 +1988,7 @@ function extractMessageText(content: unknown): string {
 
 export function registerDistillCommand(pi: ExtensionAPI): void {
   const subcommandCompletions = [
+    { value: "up", label: "up", description: "Compress back to the previous summary, or the whole branch" },
     { value: "context on", label: "context on", description: "Enable full background context" },
     { value: "context off", label: "context off", description: "Disable background context" },
     { value: "auto-clean on", label: "auto-clean on", description: "Delete old session after distill" },
@@ -1569,7 +1999,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
 
   pi.registerCommand("distill", {
     description:
-      "Context distill: /distill <label> [supplement] (tag both ends of a range with the same name); /distill del [<label>] deletes a range; /distill merge [<label>] folds sibling branches under a branch summary",
+      "Context distill: /distill <label> [supplement] (tag both ends of a range with the same name); /distill up [supplement] compresses back to the previous summary or the whole branch; /distill del [<label>] deletes a range; /distill merge [<label>] folds sibling branches under a branch summary",
     getArgumentCompletions: (argumentPrefix) => {
       const prefix = argumentPrefix.trim().toLowerCase();
       if (!prefix) return subcommandCompletions;
@@ -1653,6 +2083,14 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
         return;
       }
 
+      // /distill up [supplement] — compress the current branch back to the
+      // previous distilled summary, or the whole branch if no summary exists.
+      const upMatch = /^up(?:\s+(.+))?$/i.exec(trimmed);
+      if (upMatch) {
+        await handleUp(upMatch[1]?.trim() || undefined, ctx, config);
+        return;
+      }
+
       // /distill del [<label>] — delete the range without summarizing.
       // With no explicit label, "del" itself is the label (a tag named
       // "del" is deleted up to the current position).
@@ -1682,8 +2120,9 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
       if (parts.labels.length === 0) {
         ctx.ui.notify(
           "Usage: /distill <label> [supplement]  (tag both ends of a range with the same name)\n" +
+            "  /distill up [supplement]  compress back to the previous summary or the whole branch\n" +
             "  /distill del <label>  deletes the range without summarizing\n" +
-            "Sub-commands: context on|off  /  auto-clean on|off  /  model  /  clean",
+            "Sub-commands: up  /  context on|off  /  auto-clean on|off  /  model  /  clean",
           "warning",
         );
         return;
@@ -1695,165 +2134,19 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
         const range = await resolveRange({ startLabel: parts.labels[0] }, ctx);
         if (!range) return; // user cancelled
 
-        // Run compact engine
-        const result = await executeCompact(
-          {
-            startLabel: parts.labels[0],
-            startId: range.startId,
-            endId: range.endId,
-            // Describe the end point for error messages: a paired range
-            // ("Between the two tags") ends at the second tag, not the leaf.
-            endLabelDesc: range.pair ? "the second tag" : undefined,
-            supplement: parts.supplement,
-          },
+        await runCompactAndRebuild({
+          startLabel: parts.labels[0],
+          startId: range.startId,
+          endId: range.endId,
+          // Describe the end point for error messages: a paired range
+          // ("Between the two tags") ends at the second tag, not the leaf.
+          endLabelDesc: range.pair ? "the second tag" : undefined,
+          supplement: parts.supplement,
           config,
           ctx,
-        );
-
-        // Show summary and confirm
-        const finalSummary = await showSummaryAndConfirm(result.summary, ctx);
-
-        // Capture old session metadata before creating the replacement
-        const oldSessionFile = ctx.sessionManager.getSessionFile();
-        const oldTitle = ctx.sessionManager.getSessionName();
-        const oldLeafId = ctx.sessionManager.getLeafId();
-        const sessionDir = ctx.sessionManager.getSessionDir();
-        const cwd = ctx.cwd;
-
-        // Create replacement session, reconstructing branches from the old tree
-        await ctx.newSession({
-          setup: async (sm) => {
-            const idMap = new Map<string, string>();
-            let anchorNewId: string | undefined;
-
-            // Shared archive payload (kept out of the LLM context; used by
-            // the view tool to look up original messages).
-            const archiveData = {
-              conversations: result.segmentBC.map((m) => {
-                if (m.type === "message") {
-                  const msg = (m as unknown as { message: { role: string; content: unknown } }).message;
-                  return {
-                    role: msg.role,
-                    content:
-                      typeof msg.content === "string"
-                        ? msg.content
-                        : JSON.stringify(msg.content),
-                  };
-                }
-                const ce = m as unknown as { content: unknown };
-                return {
-                  role: "distilled_summary",
-                  content:
-                    typeof ce.content === "string"
-                      ? ce.content
-                      : JSON.stringify(ce.content),
-                };
-              }),
-              range: {
-                startLabel: parts.labels[0],
-              },
-              turnCount: result.turnCount,
-              timestamp: Date.now(),
-            };
-
-            // Side-branch range: whole-tree rebuild plan. Every entry is
-            // copied in DFS order under its remapped parent; the range is
-            // replaced by a fresh compactionSummary and the range's
-            // descendants are re-attached under it.
-            if (result.plan) {
-              const summaryContent =
-                `<distilled-summary turns="${result.turnCount}" messages="${result.segmentBC.length}">\n` +
-                `${finalSummary}\n` +
-                `</distilled-summary>`;
-              // Restore the user's position: the plan replay ends at the last
-              // DFS entry, which is not necessarily the original leaf.
-              rebuildPlanEntries(
-                sm,
-                result.plan,
-                summaryContent,
-                estimateTokens(result.segmentBC),
-                oldLeafId ?? undefined,
-              );
-              sm.appendCustomEntry("distilled-archive", archiveData);
-              return;
-            }
-
-            // Copy segment A (all entry types) linearly
-            for (const entry of result.segmentA) {
-              const newId = appendEntry(sm, entry);
-              if (newId) {
-                idMap.set(entry.id as string, newId);
-                anchorNewId = newId;
-              } else if (anchorNewId) {
-                // Pass-through entry (label / compaction / branch_summary):
-                // not copied, but branches forking off it attach under the
-                // current anchor.
-                idMap.set(entry.id as string, anchorNewId);
-              }
-            }
-
-            // Reconstruct branches that fork off segment A
-            for (const branch of result.branches) {
-              const parentNewId = idMap.get(branch.branchPointId);
-              if (!parentNewId) continue;
-              sm.branch(parentNewId);
-              for (const entry of branch.entries) {
-                appendEntry(sm, entry);
-              }
-            }
-
-            // Return to the anchor (last entry before compressed range)
-            if (anchorNewId) sm.branch(anchorNewId);
-
-            // Insert the distilled summary as a native compactionSummary
-            // message (a top-level message, NOT a custom_message). This makes
-            // it a node you can continue from: the tree selector keeps the
-            // leaf ON this entry, whereas custom_message entries move the leaf
-            // to the parent and stuff the content into the editor.
-            // The <distilled-summary> tag tells the LLM this is NOT a user
-            // message; turns/messages attrs convey the compression granularity.
-            const summaryContent =
-              `<distilled-summary turns="${result.turnCount}" messages="${result.segmentBC.length}">\n` +
-              `${finalSummary}\n` +
-              `</distilled-summary>`;
-            sm.appendMessage({
-              role: "compactionSummary",
-              summary: summaryContent,
-              tokensBefore: estimateTokens(result.segmentBC),
-              timestamp: Date.now(),
-            } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
-
-            // Copy segment D (all entry types)
-            for (const entry of result.segmentD) {
-              appendEntry(sm, entry);
-            }
-
-            // Insert archive (not in LLM context, for the view tool)
-            sm.appendCustomEntry("distilled-archive", archiveData);
-          },
-          withSession: async (freshCtx) => {
-            // Make every older session a flat sibling under the new root,
-            // mark the old title, or delete it when auto-clean is enabled.
-            const newSessionFile = freshCtx.sessionManager.getSessionFile();
-            if (oldSessionFile && newSessionFile) {
-              if (config.autoClean) {
-                deleteSession(oldSessionFile);
-              } else {
-                await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
-                setParentSession(oldSessionFile, newSessionFile);
-                markDistilledTitle(oldSessionFile, oldTitle);
-              }
-            }
-            freshCtx.ui.notify("✅ Distilled", "info");
-          },
         });
       } catch (err) {
-        if (err instanceof SummaryCancelledError) {
-          ctx.ui.notify("Summary generation cancelled", "warning");
-          return;
-        }
-        const message = err instanceof Error ? err.message : String(err);
-        ctx.ui.notify(`Distill failed: ${message}`, "error");
+        reportDistillError(ctx, err);
       }
     },
   });
