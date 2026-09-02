@@ -3,13 +3,13 @@
  * confirms with user, and rebuilds the session.
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import {
   SessionManager,
   type ExtensionAPI,
   type ExtensionCommandContext,
+  type ReplacedSessionContext,
 } from "@earendil-works/pi-coding-agent";
 
 import {
@@ -20,32 +20,60 @@ import {
 import { buildRebuildPlan } from "../engine/compact";
 import type { DistillConfig } from "../engine/compact";
 import {
+  buildRootPath,
+  collectOffPathSubtree,
+  effectiveMessageChildren,
   groupPathIntoTurns,
   PASSTHROUGH_TYPES,
   resolveAllLabels,
 } from "../engine/turn-group";
 import type { AnyEntry } from "../engine/turn-group";
-import { deleteSession, setParentSession } from "../engine/session-io";
+import {
+  configPathFor,
+  setParentSession,
+  trashDirFor,
+  trashSession,
+} from "../engine/session-io";
+
+export { collectOffPathSubtree } from "../engine/turn-group";
+
+// ---- constants -------------------------------------------------------------
+
+/** Stable option values for the "how to keep the old session" prompt. */
+const SESSION_METHOD = {
+  NEW: "New session (keep old as distilled)",
+  IN_PLACE: "In place (no record)",
+} as const;
+
+const CANCEL = "Cancel";
 
 // ---- config I/O -----------------------------------------------------------
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const CONFIG_PATH = join(__dirname, "../../config.json");
+/** Default config used when no config file exists yet. */
+function defaultConfig(): DistillConfig {
+  return { autoClean: false, summaryModel: "inherit", contextOn: false, drop: false };
+}
 
-function loadConfig(): DistillConfig {
+/**
+ * Load the project-local config (`<cwd>/.pi/distill/config.json`); missing or
+ * malformed files fall back to defaults without writing anything.
+ */
+function loadConfig(cwd: string): DistillConfig {
+  const path = configPathFor(cwd);
   try {
-    if (existsSync(CONFIG_PATH)) {
-      return JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+    if (existsSync(path)) {
+      return JSON.parse(readFileSync(path, "utf8"));
     }
   } catch {
     // fall through to defaults
   }
-  return { autoClean: false, summaryModel: "inherit", contextOn: false, drop: false };
+  return defaultConfig();
 }
 
-function saveConfig(config: DistillConfig): void {
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
+function saveConfig(cwd: string, config: DistillConfig): void {
+  const path = configPathFor(cwd);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(config, null, 2) + "\n");
 }
 
 // ---- summary confirm ------------------------------------------------------
@@ -80,19 +108,138 @@ interface RunCompactParams {
   ctx: ExtensionCommandContext;
 }
 
-/** Report a distill-flow error, canonicalizing the user-cancel case. */
+/** Report a flow error, canonicalizing the user-cancel case. */
 function reportDistillError(
   ctx: ExtensionCommandContext,
   err: unknown,
+  operation = "Distill",
 ): void {
   if (err instanceof SummaryCancelledError) {
     ctx.ui.notify("Summary generation cancelled", "warning");
     return;
   }
   const message = err instanceof Error ? err.message : String(err);
-  ctx.ui.notify(`Distill failed: ${message}`, "error");
+  ctx.ui.notify(`${operation} failed: ${message}`, "error");
 }
 
+/**
+ * Ask how to handle the old session. Returns `{ markOld: true }` (keep as
+ * [distilled]), `{ markOld: false }` (trash it), or null when cancelled.
+ */
+async function promptSessionMethod(
+  ctx: ExtensionCommandContext,
+): Promise<boolean | null> {
+  const options = [SESSION_METHOD.NEW, SESSION_METHOD.IN_PLACE, CANCEL];
+  const choice = await ctx.ui.select("Session method", options);
+  if (choice === undefined || choice === CANCEL) return null;
+  return choice === SESSION_METHOD.NEW;
+}
+
+/**
+ * Shared `withSession` handler: after the new session is live, either keep
+ * the old session (marked [distilled], flattened under the new root — or
+ * trashed when autoClean is on), or trash it in place and re-parent its
+ * children under the new session. `doneMessage` (if given) is notified after
+ * the files are handled.
+ */
+function finalizeOldSession(params: {
+  config: DistillConfig;
+  oldSessionFile: string | undefined;
+  oldTitle: string | undefined;
+  cwd: string;
+  sessionDir: string | undefined;
+  /** true = keep old marked [distilled]; false = trash in place. */
+  markOld: boolean;
+  doneMessage?: string;
+}): (freshCtx: ReplacedSessionContext) => Promise<void> {
+  const { config, oldSessionFile, oldTitle, cwd, sessionDir, markOld } =
+    params;
+  const trashDir = trashDirFor(cwd);
+
+  return async (freshCtx) => {
+    const newSessionFile = freshCtx.sessionManager.getSessionFile();
+    if (!oldSessionFile || !newSessionFile) return;
+
+    if (markOld) {
+      if (config.autoClean) {
+        trashSession(oldSessionFile, trashDir);
+      } else {
+        await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
+        setParentSession(oldSessionFile, newSessionFile);
+        markDistilledTitle(oldSessionFile, oldTitle);
+      }
+    } else {
+      // In place: rebuild into a fresh session, then trash the old file so
+      // it leaves the tree but stays recoverable in the trash dir.
+      trashSession(oldSessionFile, trashDir);
+      try {
+        const sessions = await SessionManager.list(cwd, sessionDir);
+        for (const s of sessions) {
+          if (s.path === oldSessionFile) continue;
+          if (s.parentSessionPath === oldSessionFile) {
+            setParentSession(s.path, newSessionFile);
+          }
+        }
+      } catch {
+        // Non-fatal: orphaned children fall back to roots.
+      }
+    }
+    if (params.doneMessage) {
+      freshCtx.ui.notify(params.doneMessage, "info");
+    }
+  };
+}
+
+/** Build the `distilled-archive` payload for the view tool. */
+function makeArchiveData(
+  segmentBC: ReadonlyArray<Record<string, unknown>>,
+  startLabel: string,
+  turnCount: number,
+): {
+  conversations: Array<{ role: string; content: string }>;
+  range: { startLabel: string };
+  turnCount: number;
+  timestamp: number;
+} {
+  return {
+    conversations: segmentBC.map((m) => {
+      if (m.type === "message") {
+        const msg = (
+          m as unknown as { message: { role: string; content: unknown } }
+        ).message;
+        return {
+          role: msg.role,
+          content:
+            typeof msg.content === "string"
+              ? msg.content
+              : JSON.stringify(msg.content),
+        };
+      }
+      const ce = m as unknown as { content: unknown };
+      return {
+        role: "distilled_summary",
+        content:
+          typeof ce.content === "string" ? ce.content : JSON.stringify(ce.content),
+      };
+    }),
+    range: { startLabel },
+    turnCount,
+    timestamp: Date.now(),
+  };
+}
+
+/** Wrap a final summary into the native `<distilled-summary>` message body. */
+function makeSummaryContent(
+  turnCount: number,
+  messageCount: number,
+  summary: string,
+): string {
+  return (
+    `<distilled-summary turns="${turnCount}" messages="${messageCount}">\n` +
+    `${summary}\n` +
+    `</distilled-summary>`
+  );
+}
 /**
  * Runs the compact engine, shows the summary for confirmation, and rebuilds
  * the session. Shared by the label-based flow and `/distill auto`.
@@ -140,15 +287,9 @@ async function runCompactAndRebuild(params: RunCompactParams): Promise<void> {
   } catch {
     // Non-fatal: fall back to a root session.
   }
-
   // Ask the user how to handle the old session (same as delete / merge).
-  const markChoice = await ctx.ui.select("Session method", [
-    "New session (keep old as distilled)",
-    "In place (no record)",
-    "Cancel",
-  ]);
-  if (markChoice === undefined || markChoice === "Cancel") return;
-  const markOld = markChoice === "New session (keep old as distilled)";
+  const markOld = await promptSessionMethod(ctx);
+  if (markOld === null) return; // user cancelled
 
   // Create replacement session, reconstructing branches from the old tree
   await ctx.newSession({
@@ -159,42 +300,21 @@ async function runCompactAndRebuild(params: RunCompactParams): Promise<void> {
 
       // Shared archive payload (kept out of the LLM context; used by the
       // view tool to look up original messages).
-      const archiveData = {
-        conversations: result.segmentBC.map((m) => {
-          if (m.type === "message") {
-            const msg = (m as unknown as { message: { role: string; content: unknown } }).message;
-            return {
-              role: msg.role,
-              content:
-                typeof msg.content === "string"
-                  ? msg.content
-                  : JSON.stringify(msg.content),
-            };
-          }
-          const ce = m as unknown as { content: unknown };
-          return {
-            role: "distilled_summary",
-            content:
-              typeof ce.content === "string"
-                ? ce.content
-                : JSON.stringify(ce.content),
-          };
-        }),
-        range: {
-          startLabel,
-        },
-        turnCount: result.turnCount,
-        timestamp: Date.now(),
-      };
+      const archiveData = makeArchiveData(
+        result.segmentBC,
+        startLabel,
+        result.turnCount,
+      );
 
       // Side-branch range: whole-tree rebuild plan. Every entry is copied in
       // DFS order under its remapped parent; the range is replaced by a fresh
       // compactionSummary and the range's descendants re-attached under it.
       if (result.plan) {
-        const summaryContent =
-          `<distilled-summary turns="${result.turnCount}" messages="${result.segmentBC.length}">\n` +
-          `${finalSummary}\n` +
-          `</distilled-summary>`;
+        const summaryContent = makeSummaryContent(
+          result.turnCount,
+          result.segmentBC.length,
+          finalSummary,
+        );
         // Restore the user's position: the plan replay ends at the last DFS
         // entry, which is not necessarily the original leaf.
         rebuildPlanEntries(
@@ -242,10 +362,11 @@ async function runCompactAndRebuild(params: RunCompactParams): Promise<void> {
       // content into the editor. The <distilled-summary> tag tells the LLM
       // this is NOT a user message; turns/messages attrs convey the
       // compression granularity.
-      const summaryContent =
-        `<distilled-summary turns="${result.turnCount}" messages="${result.segmentBC.length}">\n` +
-        `${finalSummary}\n` +
-        `</distilled-summary>`;
+      const summaryContent = makeSummaryContent(
+        result.turnCount,
+        result.segmentBC.length,
+        finalSummary,
+      );
       sm.appendMessage({
         role: "compactionSummary",
         summary: summaryContent,
@@ -261,36 +382,15 @@ async function runCompactAndRebuild(params: RunCompactParams): Promise<void> {
       // Insert archive (not in LLM context, for the view tool)
       sm.appendCustomEntry("distilled-archive", archiveData);
     },
-    withSession: async (freshCtx) => {
-      const newSessionFile = freshCtx.sessionManager.getSessionFile();
-      if (oldSessionFile && newSessionFile) {
-        if (markOld) {
-          // Keep the old session, marked [distilled] (or auto-clean).
-          if (config.autoClean) {
-            deleteSession(oldSessionFile);
-          } else {
-            await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
-            setParentSession(oldSessionFile, newSessionFile);
-            markDistilledTitle(oldSessionFile, oldTitle);
-          }
-        } else {
-          // In place: rebuild into a fresh session and remove the old file.
-          deleteSession(oldSessionFile);
-          try {
-            const sessions = await SessionManager.list(cwd, sessionDir);
-            for (const s of sessions) {
-              if (s.path === oldSessionFile) continue;
-              if (s.parentSessionPath === oldSessionFile) {
-                setParentSession(s.path, newSessionFile);
-              }
-            }
-          } catch {
-            // Non-fatal: orphaned children fall back to roots.
-          }
-        }
-      }
-      freshCtx.ui.notify("✅ Distilled", "info");
-    },
+    withSession: finalizeOldSession({
+      config,
+      oldSessionFile,
+      oldTitle,
+      cwd,
+      sessionDir,
+      markOld,
+      doneMessage: "✅ Distilled",
+    }),
   });
 }
 
@@ -505,8 +605,7 @@ async function resumeDistilledSession(
       },
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    ctx.ui.notify(`Fork failed: ${message}`, "error");
+    reportDistillError(ctx, err, "Fork");
   }
 }
 
@@ -534,14 +633,14 @@ async function deleteAsNewSession(
   config: DistillConfig,
   markOld: boolean,
 ): Promise<void> {
+  // Capture old session metadata before creating the replacement
   const oldSessionFile = ctx.sessionManager.getSessionFile();
   const oldTitle = ctx.sessionManager.getSessionName();
   const oldLeafId = ctx.sessionManager.getLeafId();
   const sessionDir = ctx.sessionManager.getSessionDir();
   const cwd = ctx.cwd;
 
-  // In-place rebuild keeps the old session's tree position: read its parent
-  // so the fresh session lands where the old one was.
+  // Capture the old session's parent for in-place replacement.
   let oldParentSession: string | undefined;
   try {
     oldParentSession = SessionManager.open(
@@ -599,58 +698,40 @@ async function deleteAsNewSession(
         appendEntry(sm, entry);
       }
     },
-    withSession: async (freshCtx) => {
-      const newSessionFile = freshCtx.sessionManager.getSessionFile();
-      if (oldSessionFile && newSessionFile) {
-        if (markOld) {
-          // New session: keep the old one, marked [distilled] (or auto-clean).
-          if (config.autoClean) {
-            deleteSession(oldSessionFile);
-          } else {
-            await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
-            setParentSession(oldSessionFile, newSessionFile);
-            markDistilledTitle(oldSessionFile, oldTitle);
-          }
-        } else {
-          // In place: rebuild into a fresh session and remove the old file so
-          // no leftover copy appears in the tree — "no trace". Re-parent the
-          // old session's children under the fresh one to keep the tree
-          // connected.
-          deleteSession(oldSessionFile);
-          try {
-            const sessions = await SessionManager.list(cwd, sessionDir);
-            for (const s of sessions) {
-              if (s.path === oldSessionFile) continue;
-              if (s.parentSessionPath === oldSessionFile) {
-                setParentSession(s.path, newSessionFile);
-              }
-            }
-          } catch {
-            // Non-fatal: orphaned children fall back to roots.
-          }
-        }
-      }
-      freshCtx.ui.notify(
-        markOld ? "Deleted (new session)" : "Deleted in place",
-        "info",
-      );
-    },
+    withSession: finalizeOldSession({
+      config,
+      oldSessionFile,
+      oldTitle,
+      cwd,
+      sessionDir,
+      markOld,
+      doneMessage: markOld ? "✅ Deleted (new session)" : "✅ Deleted in place",
+    }),
   });
 }
 
-// ---- label disambiguation ------------------------------------------------
+// ---- tree helpers ---------------------------------------------------------
 
-/** Extract plain text from a message content (string or content blocks). */
-function textFromMessage(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .filter((c) => c?.type === "text" && typeof c.text === "string")
-      .map((c) => c.text)
-      .join("\n");
+/**
+ * Walk up from an entry's parent through pass-through entries (labels,
+ * pi-native compaction / branch_summary) to the first real fork point.
+ * Returns null when the chain ends at the root.
+ */
+function forkParentOf(
+  byId: Map<string, Record<string, unknown>>,
+  startParentId: string | null,
+): string | null {
+  let parentId = startParentId;
+  while (
+    parentId &&
+    PASSTHROUGH_TYPES.has(byId.get(parentId)?.type as string)
+  ) {
+    parentId = byId.get(parentId)?.parentId as string | null;
   }
-  return "";
+  return parentId;
 }
+
+// ---- label disambiguation ------------------------------------------------
 
 function truncate(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n)}…` : s;
@@ -677,7 +758,7 @@ function describeTagPosition(
     const node = byId.get(targetId);
     if (node && node.type === "message") {
       const role = (node as { message?: { role?: string } }).message?.role;
-      const text = textFromMessage(
+      const text = extractMessageText(
         (node as { message: { content: unknown } }).message?.content,
       )
         .split("\n")[0]
@@ -690,16 +771,7 @@ function describeTagPosition(
     // next user message at/after it.
     const leafId = ctx.sessionManager.getLeafId();
     if (!leafId) return "";
-    const path: Array<Record<string, unknown>> = [];
-    let cur = byId.get(leafId);
-    const seen = new Set<string>();
-    while (cur && !seen.has(cur.id as string)) {
-      seen.add(cur.id as string);
-      path.unshift(cur);
-      const pid = cur.parentId as string | null;
-      if (!pid) break;
-      cur = byId.get(pid);
-    }
+    const path = buildRootPath(byId, leafId);
 
     const idx = path.findIndex((e) => e.id === targetId);
     if (idx === -1) return "(off current path)";
@@ -708,7 +780,7 @@ function describeTagPosition(
       if (e.type === "message") {
         const role = (e as { message?: { role?: string } }).message?.role;
         if (role === "user") {
-          const text = textFromMessage(
+          const text = extractMessageText(
             (e as { message: { content: unknown } }).message.content,
           )
             .split("\n")[0]
@@ -869,16 +941,7 @@ async function deleteSingleEntry(
   // current path: a point delete removes exactly the tagged turn wherever it
   // sits in the tree — it never spans branches, so branch topology needs no
   // probing.
-  const targetPath: Array<Record<string, unknown>> = [];
-  let cur = byId.get(targetId);
-  const seen = new Set<string>();
-  while (cur && !seen.has(cur.id as string)) {
-    seen.add(cur.id as string);
-    targetPath.unshift(cur);
-    const pid = cur.parentId as string | null;
-    if (!pid) break;
-    cur = byId.get(pid);
-  }
+  const targetPath = buildRootPath(byId, targetId);
   const target = targetPath[targetPath.length - 1];
   if (!target || (target.id as string) !== targetId) {
     throw new Error("Target entry not found.");
@@ -989,20 +1052,15 @@ async function handleDelete(
       // occurrence resolves straight to "tag → current position").
       const how = await ctx.ui.select(
         `Label "${label}" occurs once — delete how?`,
-        ["This turn only", "Label to current position", "Cancel"],
+        ["This turn only", "Label to current position", CANCEL],
       );
-      if (how === undefined || how === "Cancel") return;
+      if (how === undefined || how === CANCEL) return;
       single = how === "This turn only";
     }
 
     // Step 2 — old session handling (both granularities share this).
-    const markChoice = await ctx.ui.select("Delete method", [
-      "New session (keep old as distilled)",
-      "In place (no record)",
-      "Cancel",
-    ]);
-    if (markChoice === undefined || markChoice === "Cancel") return;
-    const markOld = markChoice === "New session (keep old as distilled)";
+    const markOld = await promptSessionMethod(ctx);
+    if (markOld === null) return; // user cancelled
 
     if (single) {
       await deleteSingleEntry(range.startId, ctx, config, markOld);
@@ -1022,43 +1080,8 @@ async function handleDelete(
     );
     await deleteAsNewSession(result, ctx, config, markOld);
   } catch (err) {
-    if (err instanceof SummaryCancelledError) {
-      ctx.ui.notify("Summary generation cancelled", "warning");
-      return;
-    }
-    const message = err instanceof Error ? err.message : String(err);
-    ctx.ui.notify(`Delete failed: ${message}`, "error");
+    reportDistillError(ctx, err, "Delete");
   }
-}
-
-/**
- * Collect a node's non-main-path subtree, flattened in pre-order (the node
- * itself included when includeRoot is set). Pass-through entries (labels,
- * pi-native compaction) are included — the rebuild drops them while keeping
- * their children attached under the same parent.
- */
-export function collectOffPathSubtree(
-  byId: Map<string, Record<string, unknown>>,
-  allEntries: Array<Record<string, unknown>>,
-  mainPathIds: Set<string>,
-  rootId: string,
-  includeRoot: boolean,
-): Array<Record<string, unknown>> {
-  const result: Array<Record<string, unknown>> = [];
-  const walk = (id: string, first: boolean) => {
-    const node = byId.get(id);
-    if (!node) return;
-    if (!first || includeRoot) result.push(node);
-    for (const child of allEntries.filter(
-      (e) =>
-        (e.parentId as string | null) === id &&
-        !mainPathIds.has(e.id as string),
-    )) {
-      walk(child.id as string, false);
-    }
-  };
-  walk(rootId, true);
-  return result;
 }
 
 /**
@@ -1278,13 +1301,7 @@ async function handleMerge(
     // fork point, and that parent must have more than one child branch.
     // Walk through any pass-through entries (labels etc.) sitting between
     // the summary and the fork point.
-    let parentId = srcEntry.parentId as string | null;
-    while (
-      parentId &&
-      PASSTHROUGH_TYPES.has(byId.get(parentId)?.type as string)
-    ) {
-      parentId = byId.get(parentId)?.parentId as string | null;
-    }
+    const parentId = forkParentOf(byId, srcEntry.parentId as string | null);
     if (!parentId) {
       ctx.ui.notify("Summary has no parent node.", "warning");
       return;
@@ -1303,16 +1320,7 @@ async function handleMerge(
     // Main path (root → leaf).
     const leafId = sm.getLeafId();
     if (!leafId) throw new Error("Cannot determine current leaf node.");
-    const mainPath: Array<Record<string, unknown>> = [];
-    let cur = byId.get(leafId);
-    const seen = new Set<string>();
-    while (cur && !seen.has(cur.id as string)) {
-      seen.add(cur.id as string);
-      mainPath.unshift(cur);
-      const pid = cur.parentId as string | null;
-      if (!pid) break;
-      cur = byId.get(pid);
-    }
+    const mainPath = buildRootPath(byId, leafId);
     const mainPathIds = new Set(mainPath.map((e) => e.id as string));
     const pIdx = mainPath.findIndex((e) => e.id === parentId);
     if (pIdx === -1) {
@@ -1342,22 +1350,18 @@ async function handleMerge(
       : [];
 
     // Old session handling — same two-step as delete.
-    const markChoice = await ctx.ui.select("Delete method", [
-      "New session (keep old as distilled)",
-      "In place (no record)",
-      "Cancel",
-    ]);
-    if (markChoice === undefined || markChoice === "Cancel") return;
-    const markOld = markChoice === "New session (keep old as distilled)";
+    const markOld = await promptSessionMethod(ctx);
+    if (markOld === null) return; // user cancelled
 
     // Rebuild: root → parent, then the summary as the parent's single child,
     // with every other branch of the parent re-attached under the summary.
-    const oldSessionFile = sm.getSessionFile();
-    const oldTitle = sm.getSessionName();
-    const sessionDir = sm.getSessionDir();
+    // Capture old session metadata before creating the replacement
+    const oldSessionFile = ctx.sessionManager.getSessionFile();
+    const oldTitle = ctx.sessionManager.getSessionName();
+    const sessionDir = ctx.sessionManager.getSessionDir();
     const cwd = ctx.cwd;
 
-    // In-place rebuild keeps the old session's tree position.
+    // Capture the old session's parent for in-place replacement.
     let oldParentSession: string | undefined;
     try {
       oldParentSession = SessionManager.open(
@@ -1399,47 +1403,18 @@ async function handleMerge(
           appendMerged: (sm2) => appendEntry(sm2, srcEntry),
         });
       },
-      withSession: async (freshCtx) => {
-        const newSessionFile = freshCtx.sessionManager.getSessionFile();
-        if (oldSessionFile && newSessionFile) {
-          if (markOld) {
-            if (config.autoClean) {
-              deleteSession(oldSessionFile);
-            } else {
-              await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
-              setParentSession(oldSessionFile, newSessionFile);
-              markDistilledTitle(oldSessionFile, oldTitle);
-            }
-          } else {
-            // In place: remove the old session file — no leftover copy.
-            // Re-parent its children under the fresh session.
-            deleteSession(oldSessionFile);
-            try {
-              const sessions = await SessionManager.list(cwd, sessionDir);
-              for (const s of sessions) {
-                if (s.path === oldSessionFile) continue;
-                if (s.parentSessionPath === oldSessionFile) {
-                  setParentSession(s.path, newSessionFile);
-                }
-              }
-            } catch {
-              // Non-fatal: orphaned children fall back to roots.
-            }
-          }
-        }
-        freshCtx.ui.notify(
-          "Merged branch summary into main path",
-          "info",
-        );
-      },
+      withSession: finalizeOldSession({
+        config,
+        oldSessionFile,
+        oldTitle,
+        cwd,
+        sessionDir,
+        markOld,
+        doneMessage: "✅ Merged branch summary into main path",
+      }),
     });
   } catch (err) {
-    if (err instanceof SummaryCancelledError) {
-      ctx.ui.notify("Summary generation cancelled", "warning");
-      return;
-    }
-    const message = err instanceof Error ? err.message : String(err);
-    ctx.ui.notify(`Merge failed: ${message}`, "error");
+    reportDistillError(ctx, err, "Merge");
   }
 }
 
@@ -1487,13 +1462,7 @@ async function handleDistillMerge(
 
     // The branch's parent is the fork point — walk through any pass-through
     // entries (labels etc.) sitting between them.
-    let parentId = startEntry.parentId as string | null;
-    while (
-      parentId &&
-      PASSTHROUGH_TYPES.has(byId.get(parentId)?.type as string)
-    ) {
-      parentId = byId.get(parentId)?.parentId as string | null;
-    }
+    const parentId = forkParentOf(byId, startEntry.parentId as string | null);
     if (!parentId) {
       ctx.ui.notify("Branch has no parent node.", "warning");
       return;
@@ -1512,16 +1481,7 @@ async function handleDistillMerge(
     // Main path (root → leaf).
     const leafId = sm.getLeafId();
     if (!leafId) throw new Error("Cannot determine current leaf node.");
-    const mainPath: Array<Record<string, unknown>> = [];
-    let cur = byId.get(leafId);
-    const seen = new Set<string>();
-    while (cur && !seen.has(cur.id as string)) {
-      seen.add(cur.id as string);
-      mainPath.unshift(cur);
-      const pid = cur.parentId as string | null;
-      if (!pid) break;
-      cur = byId.get(pid);
-    }
+    const mainPath = buildRootPath(byId, leafId);
     const mainPathIds = new Set(mainPath.map((e) => e.id as string));
     if (mainPath.findIndex((e) => (e.id as string) === parentId) === -1) {
       ctx.ui.notify("Parent node is not on the current path.", "warning");
@@ -1544,35 +1504,21 @@ async function handleDistillMerge(
     if (preResolvedEndId) {
       endId = preResolvedEndId;
     } else {
-      const childrenOf = new Map<
-        string | null,
-        Array<Record<string, unknown>>
-      >();
-      for (const e of allEntries) {
-        const pid = (e.parentId as string | null) ?? null;
-        const list = childrenOf.get(pid);
-        if (list) list.push(e);
-        else childrenOf.set(pid, [e]);
-      }
-      const effectiveMessageChildren = (
-        id: string,
-      ): Array<Record<string, unknown>> => {
-        const direct = childrenOf.get(id) ?? [];
-        const result: Array<Record<string, unknown>> = [];
-        for (const c of direct) {
-          if (c.type === "message") result.push(c);
-          else if (PASSTHROUGH_TYPES.has(c.type as string)) {
-            result.push(...effectiveMessageChildren(c.id as string));
-          }
-        }
-        return result;
-      };
+      const childrenOf = new Map<string | null, Array<Record<string, unknown>>>();
+  for (const e of allEntries) {
+    const pid = (e.parentId as string | null) ?? null;
+    const list = childrenOf.get(pid);
+    if (list) list.push(e);
+    else childrenOf.set(pid, [e]);
+  }
+      const kidsOf = (id: string) =>
+        effectiveMessageChildren(childrenOf, id);
       endId = startId;
       let node: Record<string, unknown> | undefined = startEntry;
       const walked = new Set<string>();
       while (node && !walked.has(node.id as string)) {
         walked.add(node.id as string);
-        const kids = effectiveMessageChildren(node.id as string);
+        const kids = kidsOf(node.id as string);
         if (kids.length > 1) {
           throw new Error(
             "Branch detected in range — not supported yet. Distill before/after the branch point separately.",
@@ -1613,20 +1559,16 @@ async function handleDistillMerge(
     );
 
     // Old session handling — same two-step as delete/merge.
-    const markChoice = await ctx.ui.select("Delete method", [
-      "New session (keep old as distilled)",
-      "In place (no record)",
-      "Cancel",
-    ]);
-    if (markChoice === undefined || markChoice === "Cancel") return;
-    const markOld = markChoice === "New session (keep old as distilled)";
+    const markOld = await promptSessionMethod(ctx);
+    if (markOld === null) return; // user cancelled
 
-    const oldSessionFile = sm.getSessionFile();
-    const oldTitle = sm.getSessionName();
-    const sessionDir = sm.getSessionDir();
+    // Capture old session metadata before creating the replacement
+    const oldSessionFile = ctx.sessionManager.getSessionFile();
+    const oldTitle = ctx.sessionManager.getSessionName();
+    const sessionDir = ctx.sessionManager.getSessionDir();
     const cwd = ctx.cwd;
 
-    // In-place rebuild keeps the old session's tree position.
+    // Capture the old session's parent for in-place replacement.
     let oldParentSession: string | undefined;
     try {
       oldParentSession = SessionManager.open(
@@ -1639,10 +1581,11 @@ async function handleDistillMerge(
     await ctx.newSession({
       parentSession: markOld ? undefined : oldParentSession,
       setup: async (sm2) => {
-        const summaryContent =
-          `<distilled-summary turns="${result.turnCount}" messages="${result.segmentBC.length}">\n` +
-          `${finalSummary}\n` +
-          `</distilled-summary>`;
+        const summaryContent = makeSummaryContent(
+          result.turnCount,
+          result.segmentBC.length,
+          finalSummary,
+        );
         rebuildMerged(sm2, {
           segmentA,
           mainAfterParent,
@@ -1668,69 +1611,25 @@ async function handleDistillMerge(
         });
 
         // Archive the original branch content for view_distilled_context.
-        const archiveData = {
-          conversations: result.segmentBC.map((m) => {
-            if (m.type === "message") {
-              const msg = (
-                m as unknown as { message: { role: string; content: unknown } }
-              ).message;
-              return {
-                role: msg.role,
-                content:
-                  typeof msg.content === "string"
-                    ? msg.content
-                    : JSON.stringify(msg.content),
-              };
-            }
-            const ce = m as unknown as { content: unknown };
-            return {
-              role: "distilled_summary",
-              content:
-                typeof ce.content === "string"
-                  ? ce.content
-                  : JSON.stringify(ce.content),
-            };
-          }),
-          range: { startLabel: label },
-          turnCount: result.turnCount,
-          timestamp: Date.now(),
-        };
+        const archiveData = makeArchiveData(
+          result.segmentBC,
+          label,
+          result.turnCount,
+        );
         sm2.appendCustomEntry("distilled-archive", archiveData);
       },
-      withSession: async (freshCtx) => {
-        const newSessionFile = freshCtx.sessionManager.getSessionFile();
-        if (oldSessionFile && newSessionFile) {
-          if (markOld) {
-            if (config.autoClean) {
-              deleteSession(oldSessionFile);
-            } else {
-              await flattenDistilledSessions(newSessionFile, cwd, sessionDir);
-              setParentSession(oldSessionFile, newSessionFile);
-              markDistilledTitle(oldSessionFile, oldTitle);
-            }
-          } else {
-            // In place: remove the old session file — no leftover copy.
-            // Re-parent its children under the fresh session.
-            deleteSession(oldSessionFile);
-            try {
-              const sessions = await SessionManager.list(cwd, sessionDir);
-              for (const s of sessions) {
-                if (s.path === oldSessionFile) continue;
-                if (s.parentSessionPath === oldSessionFile) {
-                  setParentSession(s.path, newSessionFile);
-                }
-              }
-            } catch {
-              // Non-fatal: orphaned children fall back to roots.
-            }
-          }
-        }
-        freshCtx.ui.notify("Branch summarized and merged", "info");
-      },
+      withSession: finalizeOldSession({
+        config,
+        oldSessionFile,
+        oldTitle,
+        cwd,
+        sessionDir,
+        markOld,
+        doneMessage: "✅ Branch summarized and merged",
+      }),
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    ctx.ui.notify(`Merge failed: ${message}`, "error");
+    reportDistillError(ctx, err, "Merge");
   }
 }
 
@@ -1769,12 +1668,7 @@ async function handleMergeOrSummarize(
       );
     }
   } catch (err) {
-    if (err instanceof SummaryCancelledError) {
-      ctx.ui.notify("Summary generation cancelled", "warning");
-      return;
-    }
-    const message = err instanceof Error ? err.message : String(err);
-    ctx.ui.notify(`Merge failed: ${message}`, "error");
+    reportDistillError(ctx, err, "Merge");
   }
 }
 
@@ -1808,18 +1702,8 @@ export function findCleanBranchRange(
   const leafId = sm.getLeafId();
   if (!leafId) return { error: "Cannot determine current leaf node." };
 
-  // Build path root → leaf.
-  const path: Array<Record<string, unknown>> = [];
-  let cur = byId.get(leafId);
-  const seen = new Set<string>();
-  while (cur && !seen.has(cur.id as string)) {
-    seen.add(cur.id as string);
-    path.unshift(cur);
-    const pid = cur.parentId as string | null;
-    cur = pid ? byId.get(pid) : undefined;
-  }
-
-  // Build children index and effective-message-children helper.
+  // Build path root → leaf and the children index.
+  const path = buildRootPath(byId, leafId);
   const childrenOf = new Map<string | null, Array<Record<string, unknown>>>();
   for (const e of allEntries) {
     const pid = (e.parentId as string | null) ?? null;
@@ -1827,19 +1711,7 @@ export function findCleanBranchRange(
     if (list) list.push(e);
     else childrenOf.set(pid, [e]);
   }
-  const effectiveMessageChildren = (
-    id: string,
-  ): Array<Record<string, unknown>> => {
-    const direct = childrenOf.get(id) ?? [];
-    const result: Array<Record<string, unknown>> = [];
-    for (const c of direct) {
-      if (c.type === "message") result.push(c);
-      else if (PASSTHROUGH_TYPES.has(c.type as string)) {
-        result.push(...effectiveMessageChildren(c.id as string));
-      }
-    }
-    return result;
-  };
+  const effKids = (id: string) => effectiveMessageChildren(childrenOf, id);
 
   /**
    * Count messages from `startIdx` (inclusive) to the leaf, and return the
@@ -1919,7 +1791,7 @@ export function findCleanBranchRange(
     }
 
     // Check for fork.
-    const kids = effectiveMessageChildren(e.id as string);
+    const kids = effKids(e.id as string);
     if (kids.length > 1) {
       if (summaryIdx !== -1) {
         // Fork above the summary — not in the range, ignore.
@@ -1977,6 +1849,26 @@ export function findCleanBranchRange(
 }
 
 /**
+ * Ask for confirmation of a compress/merge action. Renders a two-line
+ * option: the action text plus a dimmed preview of the first message.
+ * Returns true when confirmed, false when cancelled.
+ */
+async function confirmRangeAction(
+  ctx: ExtensionCommandContext,
+  title: string,
+  action: string,
+  firstMessage: string | undefined,
+): Promise<boolean> {
+  const dim = (s: string) => ctx.ui.theme.fg("dim", s);
+  const preview = firstMessage
+    ? `\n${dim(`  ↳ ${truncate(firstMessage.replace(/\n/g, " "), 50)}`)}`
+    : "";
+  const options = [`${action}${preview}`, CANCEL];
+  const choice = await ctx.ui.select(title, options);
+  return choice !== undefined && choice !== CANCEL;
+}
+
+/**
  * `/distill up [supplement]`: find the previous distilled summary on the
  * current branch (or the whole branch if no summary exists), ask for
  * confirmation showing the first message preview, and compress that range.
@@ -1993,23 +1885,18 @@ async function handleUp(
       return;
     }
 
-    // Build a two-line confirmation option: main text + gray preview.
     const kind = found.summaryId
       ? "since the previous summary"
       : "on this branch";
-    const dim = (s: string) => ctx.ui.theme.fg("dim", s);
-    const preview = found.firstMessage
-      ? `\n${dim(`  ↳ ${truncate(found.firstMessage.replace(/\n/g, " "), 50)}`)}`
-      : "";
-    const options = [
-      `Compress the ${found.messageCount} message(s) ${kind}${preview}`,
-      "Cancel",
-    ];
-    const choice = await ctx.ui.select(
-      "Distill the current branch up to the previous summary?",
-      options,
+    const ok = await confirmRangeAction(
+      ctx,
+      found.summaryId
+        ? "Distill the current branch up to the previous summary?"
+        : "Compress the whole current branch?",
+      `Compress the ${found.messageCount} message(s) ${kind}`,
+      found.firstMessage,
     );
-    if (choice === undefined || choice === options[1]) return; // user cancelled
+    if (!ok) return; // user cancelled
 
     await runCompactAndRebuild({
       startLabel: found.summaryId ? "[up] previous summary" : "[up] branch start",
@@ -2049,19 +1936,13 @@ async function handleMergeAuto(
     // we just compress — no merge topology to rearrange.
     if (found.summaryId !== null) {
       // Fallback to compress-only (same as `up`).
-      const dim = (s: string) => ctx.ui.theme.fg("dim", s);
-      const preview = found.firstMessage
-        ? `\n${dim(`  ↳ ${truncate(found.firstMessage.replace(/\n/g, " "), 50)}`)}`
-        : "";
-      const options = [
-        `Compress the ${found.messageCount} message(s) since the previous summary${preview}`,
-        "Cancel",
-      ];
-      const choice = await ctx.ui.select(
+      const ok = await confirmRangeAction(
+        ctx,
         "No branch to merge — compress only?",
-        options,
+        `Compress the ${found.messageCount} message(s) since the previous summary`,
+        found.firstMessage,
       );
-      if (choice === undefined || choice === options[1]) return;
+      if (!ok) return;
 
       await runCompactAndRebuild({
         startLabel: "[merge] previous summary",
@@ -2075,19 +1956,13 @@ async function handleMergeAuto(
     }
 
     // Phase 2: we have a fork point — confirm and do the full merge.
-    const dim = (s: string) => ctx.ui.theme.fg("dim", s);
-    const preview = found.firstMessage
-      ? `\n${dim(`  ↳ ${truncate(found.firstMessage.replace(/\n/g, " "), 50)}`)}`
-      : "";
-    const options = [
-      `Compress and merge the ${found.messageCount} message(s) on this branch${preview}`,
-      "Cancel",
-    ];
-    const choice = await ctx.ui.select(
+    const ok = await confirmRangeAction(
+      ctx,
       "Merge the current branch into the fork point?",
-      options,
+      `Compress and merge the ${found.messageCount} message(s) on this branch`,
+      found.firstMessage,
     );
-    if (choice === undefined || choice === options[1]) return;
+    if (!ok) return; // user cancelled
 
     // Execute the full distill + merge (same as handleDistillMerge).
     // Pass the pre-resolved endId so the range stops at the current leaf,
@@ -2100,11 +1975,7 @@ async function handleMergeAuto(
       found.endId,
     );
   } catch (err) {
-    if (err instanceof SummaryCancelledError) {
-      ctx.ui.notify("Summary generation cancelled", "warning");
-      return;
-    }
-    reportDistillError(ctx, err);
+    reportDistillError(ctx, err, "Merge");
   }
 }
 
@@ -2121,17 +1992,76 @@ function extractMessageText(content: unknown): string {
     .join("\n");
 }
 
+// ---- /distill clean -------------------------------------------------------
+
+/**
+ * Reclaim `[distilled]` sessions into the project-local trash dir. With
+ * `all`, scans every project's sessions (each moves into its own project's
+ * trash). Trash contents are never deleted by the extension — remove files
+ * manually if you want them gone.
+ */
+async function runClean(ctx: ExtensionCommandContext, all: boolean): Promise<void> {
+  const isDistilled = (name: string | undefined) =>
+    name?.startsWith("[distilled ");
+
+  if (!all) {
+    const sessionDir = ctx.sessionManager.getSessionDir();
+    const sessions = await SessionManager.list(ctx.cwd, sessionDir);
+    const distilled = sessions.filter((s) => isDistilled(s.name));
+    const trashDir = trashDirFor(ctx.cwd);
+    let moved = 0;
+    for (const s of distilled) {
+      if (trashSession(s.path, trashDir)) moved++;
+    }
+    ctx.ui.notify(
+      moved > 0
+        ? `Moved ${moved} distilled session(s) to trash (${trashDir})`
+        : "No distilled sessions in this project.",
+      "info",
+    );
+    return;
+  }
+
+  const sessions = await SessionManager.listAll();
+  const distilled = sessions.filter((s) => isDistilled(s.name));
+  let moved = 0;
+  let skipped = 0;
+  for (const s of distilled) {
+    // Old sessions may lack a cwd; without it we cannot map them to a
+    // project-local trash dir, so leave them in place.
+    if (!s.cwd) {
+      skipped++;
+      continue;
+    }
+    if (trashSession(s.path, trashDirFor(s.cwd))) moved++;
+    else skipped++;
+  }
+  ctx.ui.notify(
+    moved > 0
+      ? `Moved ${moved} distilled session(s) across projects to trash` +
+        (skipped > 0 ? ` (${skipped} skipped)` : "")
+      : skipped > 0
+        ? `No movable distilled sessions (${skipped} without a project skipped)`
+        : "No distilled sessions found.",
+    "info",
+  );
+}
+
 // ---- command registration -------------------------------------------------
 
 export function registerDistillCommand(pi: ExtensionAPI): void {
   const subcommandCompletions = [
     { value: "up", label: "up", description: "Compress back to the previous summary, or the whole branch" },
+    { value: "del", label: "del", description: "Delete a range (add a label name to delete by tag)" },
+    { value: "merge", label: "merge", description: "Compress + merge the current branch, or merge by label" },
+    { value: "fork", label: "fork", description: "Fork a distilled session and continue" },
     { value: "context on", label: "context on", description: "Enable full background context" },
     { value: "context off", label: "context off", description: "Disable background context" },
     { value: "auto-clean on", label: "auto-clean on", description: "Delete old session after distill" },
     { value: "auto-clean off", label: "auto-clean off", description: "Keep old sessions (marked [distilled])" },
     { value: "model", label: "model", description: "Select summary model" },
-    { value: "clean", label: "clean", description: "Delete all distilled sessions" },
+    { value: "clean", label: "clean", description: "Reclaim this project's distilled sessions to trash" },
+    { value: "clean all", label: "clean all", description: "Reclaim distilled sessions from every project" },
   ];
 
   pi.registerCommand("distill", {
@@ -2145,7 +2075,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
       );
     },
     handler: async (args, ctx) => {
-      const config = loadConfig();
+      const config = loadConfig(ctx.cwd);
 
       // ---- sub-commands ---------------------------------------------------
 
@@ -2155,7 +2085,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
       if (/^context\s+(on|off)$/i.test(trimmed)) {
         const on = trimmed.split(/\s+/)[1].toLowerCase() === "on";
         config.contextOn = on;
-        saveConfig(config);
+        saveConfig(ctx.cwd, config);
         ctx.ui.notify(`Context background: ${on ? "ON" : "OFF"}`, "info");
         return;
       }
@@ -2164,7 +2094,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
       if (/^auto-clean\s+(on|off)$/i.test(trimmed)) {
         const on = trimmed.split(/\s+/)[1].toLowerCase() === "on";
         config.autoClean = on;
-        saveConfig(config);
+        saveConfig(ctx.cwd, config);
         ctx.ui.notify(`Auto-clean: ${on ? "ON" : "OFF"}`, "info");
         return;
       }
@@ -2184,25 +2114,28 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
           );
           if (matched) {
             config.summaryModel = `${matched.provider}/${matched.id}`;
-            saveConfig(config);
+            saveConfig(ctx.cwd, config);
             ctx.ui.notify(`Summary model: ${config.summaryModel}`, "info");
           }
         }
         return;
       }
 
-      // /distill clean
-      if (/^clean$/i.test(trimmed)) {
-        const sessionDir = ctx.sessionManager.getSessionDir();
-        const sessions = await SessionManager.list(ctx.cwd, sessionDir);
-        const distilled = sessions.filter((s) =>
-          s.name?.startsWith("[distilled "),
-        );
-        let deleted = 0;
-        for (const s of distilled) {
-          if (deleteSession(s.path)) deleted++;
+      // /distill clean [all] — reclaim [distilled] sessions into the trash.
+      // `clean` only touches the current project's sessions; `clean all`
+      // reclaims distilled sessions from every project. The extension never
+      // permanently deletes trash contents — remove them manually if needed.
+      const cleanMatch = /^clean(?:\s+(.+))?$/i.exec(trimmed);
+      if (cleanMatch) {
+        const arg = cleanMatch[1]?.trim();
+        if (arg && arg.toLowerCase() !== "all") {
+          ctx.ui.notify(
+            "Usage: /distill clean  (current project only)\n  /distill clean all  (every project)",
+            "warning",
+          );
+          return;
         }
-        ctx.ui.notify(`Deleted ${deleted} distilled session(s)`, "info");
+        await runClean(ctx, arg?.toLowerCase() === "all");
         return;
       }
 
@@ -2263,7 +2196,7 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
             "  /distill up [supplement]  compress back to the previous summary or the whole branch\n" +
             "  /distill del <label>  deletes the range without summarizing\n" +
             "  /distill merge [<label>]  auto-detect current branch and merge (no label) or merge by label\n" +
-            "Sub-commands: up  /  context on|off  /  auto-clean on|off  /  model  /  clean",
+            "Sub-commands: up  /  context on|off  /  auto-clean on|off  /  model  /  clean [all]",
           "warning",
         );
         return;
