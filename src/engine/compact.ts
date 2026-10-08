@@ -88,6 +88,22 @@ export interface DistillConfig {
 
 // ---- branch detection -----------------------------------------------------
 
+/**
+ * True when `id` has a message descendant that is off the given path.
+ * Intermediate non-message entries (labels, custom state, …) are walked
+ * through, so a fork is found no matter which node it hangs off.
+ */
+function hasOffPathMessageDescendant(
+  allEntries: Array<Record<string, unknown>>,
+  byId: Map<string, Record<string, unknown>>,
+  offPathExclude: Set<string>,
+  id: string,
+): boolean {
+  return collectOffPathSubtree(byId, allEntries, offPathExclude, id, false).some(
+    (e) => e.type === "message",
+  );
+}
+
 function hasBranchInRange(
   allEntries: Array<Record<string, unknown>>,
   byId: Map<string, Record<string, unknown>>,
@@ -104,19 +120,12 @@ function hasBranchInRange(
   }
   pathIds.add(startId);
 
-  const messageEntries = allEntries.filter((e) => e.type === "message");
+  // A child that continues the main path (root → leaf) past endId is
+  // segmentD, not a fork — only off-path message branches count. Walking the
+  // whole off-path subtree (rather than direct message children only) keeps
+  // this check in agreement with collectBranches().
   for (const id of pathIds) {
-    const children = messageEntries.filter(
-      (e) => (e.parentId as string | null) === id,
-    );
-    // A child that continues the main path (root → leaf) past endId is
-    // segmentD, not a fork — only off-path children are branches.
-    if (
-      children.some(
-        (c) =>
-          !pathIds.has(c.id as string) && !fullPathIds.has(c.id as string),
-      )
-    ) {
+    if (hasOffPathMessageDescendant(allEntries, byId, fullPathIds, id)) {
       return true;
     }
   }
@@ -133,30 +142,22 @@ export interface BranchData {
 }
 
 /**
- * Find all branches that fork off the main path (fullPath).
- * Only collects branches whose fork point is an ancestor of the compressed
- * range — branches after endId are not preserved (they are replaced by the
- * summary → segmentD chain).
+ * Find all branches that fork off the main path (fullPath), at ANY point on
+ * it — including after the compressed range. The rebuild re-attaches each one
+ * at its own fork point, so off-path content is never dropped.
  */
 export function collectBranches(
   allEntries: Array<Record<string, unknown>>,
   byId: Map<string, Record<string, unknown>>,
   fullPath: Array<Record<string, unknown>>,
-  endId: string,
 ): BranchData[] {
   const fullPathIds = new Set(fullPath.map((e) => e.id as string));
   const result: BranchData[] = [];
 
-  // Only consider fork points up to and including endId.
-  // Branches after endId would conflict with the summary chain.
-  const endIdx = fullPath.findIndex((e) => (e.id as string) === endId);
-  const eligibleIds = new Set(
-    fullPath.slice(0, endIdx + 1).map((e) => e.id as string),
-  );
-
   // Collect each fork point's off-path subtree (all entry types — labels,
   // model changes etc. are preserved alongside messages).
-  for (const id of eligibleIds) {
+  for (const entry of fullPath) {
+    const id = entry.id as string;
     const branchEntries = collectOffPathSubtree(
       byId,
       allEntries,
@@ -168,7 +169,6 @@ export function collectBranches(
       result.push({ branchPointId: id, entries: branchEntries });
     }
   }
-
   return result;
 }
 
@@ -455,7 +455,7 @@ interface CompactResult {
   /** All entries after the compressed range (messages + non-messages). */
   segmentD: AnyEntry[];
   turnCount: number;
-  /** Branches that fork off the main path before endId. */
+  /** Branches that fork off the main path (any point on it). */
   branches: BranchData[];
   /**
    * Whole-tree rebuild plan (side-branch ranges). When set, segmentA/D and
@@ -684,17 +684,16 @@ export async function executeCompact(
       node = kids[0];
     }
 
-    // Branch check — children of range nodes that are neither on the range
-    // chain nor the continuation are real forks; reject (same as main path).
-    const messageEntries = allEntries.filter((e) => e.type === "message");
+    // Branch check — any off-path message descendant of a range node (other
+    // than the continuation chain) is a real fork; reject (same as main path).
+    const continuationExclude = new Set([...bcIds, ...continuationIds]);
     for (const id of bcIds) {
-      const kids = messageEntries.filter(
-        (e) => (e.parentId as string | null) === id,
-      );
       if (
-        kids.some(
-          (c) =>
-            !bcIds.has(c.id as string) && !continuationIds.has(c.id as string),
+        hasOffPathMessageDescendant(
+          allEntries,
+          byId,
+          continuationExclude,
+          id,
         )
       ) {
         throw new Error(
@@ -772,7 +771,22 @@ export async function executeCompact(
     turnCount = fullEndTurn - fullStartTurn + 1;
 
     // Collect branches that fork off the main path (preserved in new session)
-    branches = collectBranches(allEntries, byId, fullPath, endId);
+    branches = collectBranches(allEntries, byId, fullPath);
+
+    // Invariant: a fork point inside the compressed range cannot be
+    // re-attached (its anchor is replaced by the summary), so it must be
+    // rejected — never silently dropped. The detection above is expected to
+    // catch this first; this guard keeps any future gap from losing data.
+    const rangeEntryIds = new Set(
+      segmentBCTurns.flatMap((t) => t.entries.map((e) => e.id as string)),
+    );
+    for (const b of branches) {
+      if (rangeEntryIds.has(b.branchPointId)) {
+        throw new Error(
+          "Branch detected in range — not supported yet. Distill before/after the branch point separately.",
+        );
+      }
+    }
   }
 
   // Get background messages

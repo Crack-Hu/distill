@@ -15,6 +15,7 @@ import {
 import {
   executeCompact,
   SummaryCancelledError,
+  type BranchData,
   type PlanEntry,
 } from "../engine/compact";
 import { buildRebuildPlan } from "../engine/compact";
@@ -295,9 +296,6 @@ async function runCompactAndRebuild(params: RunCompactParams): Promise<void> {
   await ctx.newSession({
     parentSession: markOld ? undefined : oldParentSession ?? undefined,
     setup: async (sm) => {
-      const idMap = new Map<string, string>();
-      let anchorNewId: string | undefined;
-
       // Shared archive payload (kept out of the LLM context; used by the
       // view tool to look up original messages).
       const archiveData = makeArchiveData(
@@ -328,56 +326,18 @@ async function runCompactAndRebuild(params: RunCompactParams): Promise<void> {
         return;
       }
 
-      // Copy segment A (all entry types) linearly
-      for (const entry of result.segmentA) {
-        const newId = appendEntry(sm, entry);
-        if (newId) {
-          idMap.set(entry.id as string, newId);
-          anchorNewId = newId;
-        } else if (anchorNewId) {
-          // Pass-through entry (label / compaction / branch_summary): not
-          // copied, but branches forking off it attach under the current
-          // anchor.
-          idMap.set(entry.id as string, anchorNewId);
-        }
-      }
-
-      // Reconstruct branches that fork off segment A
-      for (const branch of result.branches) {
-        const parentNewId = idMap.get(branch.branchPointId);
-        if (!parentNewId) continue;
-        sm.branch(parentNewId);
-        for (const entry of branch.entries) {
-          appendEntry(sm, entry);
-        }
-      }
-
-      // Return to the anchor (last entry before compressed range)
-      if (anchorNewId) sm.branch(anchorNewId);
-
-      // Insert the distilled summary as a native compactionSummary message (a
-      // top-level message, NOT a custom_message). This makes it a node you can
-      // continue from: the tree selector keeps the leaf ON this entry, whereas
-      // custom_message entries move the leaf to the parent and stuff the
-      // content into the editor. The <distilled-summary> tag tells the LLM
-      // this is NOT a user message; turns/messages attrs convey the
-      // compression granularity.
-      const summaryContent = makeSummaryContent(
-        result.turnCount,
-        result.segmentBC.length,
-        finalSummary,
-      );
-      sm.appendMessage({
-        role: "compactionSummary",
-        summary: summaryContent,
-        tokensBefore: estimateTokens(result.segmentBC),
-        timestamp: Date.now(),
-      } as unknown as Parameters<SessionManager["appendMessage"]>[0]);
-
-      // Copy segment D (all entry types)
-      for (const entry of result.segmentD) {
-        appendEntry(sm, entry);
-      }
+      // Main-path range: linear rebuild with a fresh compactionSummary. The
+      // summary is a native message (a top-level node you can continue from);
+      // the <distilled-summary> tag tells the LLM this is NOT a user message,
+      // and turns/messages attrs convey the compression granularity.
+      rebuildLinearRange(sm, result, {
+        summaryContent: makeSummaryContent(
+          result.turnCount,
+          result.segmentBC.length,
+          finalSummary,
+        ),
+        summaryTokens: estimateTokens(result.segmentBC),
+      });
 
       // Insert archive (not in LLM context, for the view tool)
       sm.appendCustomEntry("distilled-archive", archiveData);
@@ -444,6 +404,84 @@ export function appendEntry(
     default:
       return undefined;
   }
+}
+
+/**
+ * Rebuild a session linearly from compact segments: copy segment A, insert an
+ * optional fresh summary, copy segment D, re-attach every off-path branch at
+ * its fork point (segment A or segment D), then restore the leaf to the tail
+ * of the rebuilt chain.
+ *
+ * Shared by the distill flow (with `summaryContent`) and range deletion
+ * (without), so both preserve branches identically — including forks that sit
+ * after the compressed range.
+ */
+export function rebuildLinearRange(
+  sm: { [k: string]: any },
+  result: {
+    segmentA: AnyEntry[];
+    segmentBC: AnyEntry[];
+    segmentD: AnyEntry[];
+    branches: BranchData[];
+    turnCount: number;
+  },
+  opts?: { summaryContent?: string; summaryTokens?: number },
+): void {
+  const idMap = new Map<string, string>();
+  let anchorNewId: string | undefined;
+
+  // Copy segment A (all entry types) linearly. Pass-through entries (labels,
+  // pi-native compaction) are not copied; children and branches that fork off
+  // them attach under the current chain tail.
+  for (const entry of result.segmentA) {
+    const newId = appendEntry(sm, entry);
+    if (newId) {
+      idMap.set(entry.id as string, newId);
+      anchorNewId = newId;
+    } else if (anchorNewId) {
+      idMap.set(entry.id as string, anchorNewId);
+    }
+  }
+
+  if (anchorNewId) sm.branch(anchorNewId);
+
+  let summaryNewId: string | undefined;
+  if (opts?.summaryContent !== undefined) {
+    summaryNewId = sm.appendMessage({
+      role: "compactionSummary",
+      summary: opts.summaryContent,
+      tokensBefore: opts.summaryTokens ?? 0,
+      timestamp: Date.now(),
+    });
+  }
+
+  // Copy segment D (all entry types), recording ids so branches forking off
+  // it can be re-attached below.
+  let leafNewId: string | undefined;
+  for (const entry of result.segmentD) {
+    const newId = appendEntry(sm, entry);
+    if (newId) {
+      idMap.set(entry.id as string, newId);
+      leafNewId = newId;
+    } else if (leafNewId) {
+      idMap.set(entry.id as string, leafNewId);
+    }
+  }
+
+  // Re-attach every off-path branch at its fork point (segment A or D).
+  for (const branch of result.branches) {
+    const parentNewId = idMap.get(branch.branchPointId);
+    if (!parentNewId) continue;
+    sm.branch(parentNewId);
+    for (const entry of branch.entries) {
+      appendEntry(sm, entry);
+    }
+  }
+
+  // Restore the leaf to the tail of the rebuilt chain (segment D end, the
+  // summary when segment D is empty, or the anchor when both are empty).
+  const tailId = leafNewId ?? summaryNewId ?? anchorNewId;
+  if (tailId) sm.branch(tailId);
 }
 
 /**
@@ -655,9 +693,6 @@ async function deleteAsNewSession(
     // re-parented under the new one (new-session mode).
     parentSession: markOld ? undefined : oldParentSession,
     setup: async (sm) => {
-      const idMap = new Map<string, string>();
-      let anchorNewId: string | undefined;
-
       // Whole-tree rebuild: copy every entry in DFS order except the deleted
       // turn; each entry is appended under its (remapped) parent. The deleted
       // turn's children already point at the deleted turn's parent.
@@ -671,32 +706,9 @@ async function deleteAsNewSession(
         return;
       }
 
-      for (const entry of result.segmentA) {
-        const newId = appendEntry(sm, entry);
-        if (newId) {
-          idMap.set(entry.id as string, newId);
-          anchorNewId = newId;
-        } else if (anchorNewId) {
-          // Pass-through entry (label / compaction / branch_summary): not
-          // copied, but branches forking off it attach under the anchor.
-          idMap.set(entry.id as string, anchorNewId);
-        }
-      }
-
-      for (const branch of result.branches) {
-        const parentNewId = idMap.get(branch.branchPointId);
-        if (!parentNewId) continue;
-        sm.branch(parentNewId);
-        for (const entry of branch.entries) {
-          appendEntry(sm, entry);
-        }
-      }
-
-      if (anchorNewId) sm.branch(anchorNewId);
-
-      for (const entry of result.segmentD) {
-        appendEntry(sm, entry);
-      }
+      // Linear rebuild without a summary: the range is dropped, and every
+      // off-path branch (including forks after the range) is re-attached.
+      rebuildLinearRange(sm, result);
     },
     withSession: finalizeOldSession({
       config,
