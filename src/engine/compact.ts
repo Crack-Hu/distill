@@ -24,7 +24,7 @@ import {
   PASSTHROUGH_TYPES,
   resolveLabel,
 } from "./turn-group";
-import type { AnyEntry } from "./turn-group";
+import type { AnyEntry, Turn } from "./turn-group";
 import { buildSummaryPrompt, formatMessages } from "./prompt";
 import { LOG_KEEP, logDirFor } from "./session-io";
 
@@ -84,6 +84,38 @@ export interface DistillConfig {
   contextOn: boolean;
   /** Skip summary generation and simply drop the compressed range. */
   drop: boolean;
+}
+
+// ---- range helpers -------------------------------------------------------
+
+/**
+ * First entry index that belongs to the compressed range inside the turn
+ * containing the range start.
+ *
+ * Normally the whole turn is included, so a question → answer pair is never
+ * split (a label on an assistant reply pulls its leading user message into the
+ * range). The exception: when the turn begins with a distilled summary and the
+ * range starts at a later entry — an assistant reply that follows a summary
+ * belongs to the summary's turn — the summary itself stays out of the range.
+ * It marks where older history was compacted and must not be swallowed by the
+ * new summary.
+ */
+function rangeStartIndexInTurn(turn: Turn, effectiveStartId: string): number {
+  const first = turn.entries[0];
+  const role = (first as { message?: { role?: string } } | undefined)?.message
+    ?.role;
+  if (
+    first &&
+    first.type === "message" &&
+    role === "compactionSummary" &&
+    (first.id as string) !== effectiveStartId
+  ) {
+    const cut = turn.entries.findIndex(
+      (e) => (e.id as string) === effectiveStartId,
+    );
+    if (cut > 0) return cut;
+  }
+  return 0;
 }
 
 // ---- branch detection -----------------------------------------------------
@@ -661,13 +693,23 @@ export async function executeCompact(
       );
     }
 
-    const segmentBCTurns = turns.slice(fullStartTurn, fullEndTurn + 1);
-    const bcIds = new Set(
-      segmentBCTurns.flatMap((t) => t.entries.map((e) => e.id as string)),
+    // Same summary-boundary rule as the main path: a range starting inside a
+    // distilled-summary turn keeps the summary out of the range.
+    const branchStartTurn = turns[fullStartTurn];
+    const branchStartIdx = rangeStartIndexInTurn(
+      branchStartTurn,
+      effectiveStartId,
     );
-    segmentBC = segmentBCTurns
-      .flatMap((t) => t.entries)
-      .filter((e) => e.type === "message");
+    const rangeEntries: AnyEntry[] = [
+      ...branchStartTurn.entries.slice(branchStartIdx),
+      ...turns
+        .slice(fullStartTurn + 1, fullEndTurn + 1)
+        .flatMap((t) => t.entries),
+    ];
+    const bcIds = new Set(
+      rangeEntries.map((e) => e.id as string),
+    );
+    segmentBC = rangeEntries.filter((e) => e.type === "message");
     turnCount = fullEndTurn - fullStartTurn + 1;
 
     // Continuation: the unique-child message chain below endId is the
@@ -750,13 +792,26 @@ export async function executeCompact(
       segmentA.push(...turns[i].entries);
     }
 
-    const segmentBCTurns = turns.slice(fullStartTurn, fullEndTurn + 1);
+    // Keep a distilled-summary turn boundary out of the range (see
+    // rangeStartIndexInTurn): the summary goes to segmentA, the range starts
+    // at the requested entry.
+    const startTurn = turns[fullStartTurn];
+    const startIdx = rangeStartIndexInTurn(startTurn, effectiveStartId);
+    if (startIdx > 0) {
+      segmentA.push(...startTurn.entries.slice(0, startIdx));
+    }
+
     // Include messages AND previously distilled summaries, so a second
     // distill never drops the first one's content. (Distilled summaries are
     // stored as compactionSummary messages, so plain message entries cover
     // both.)
-    for (const t of segmentBCTurns) {
-      for (const e of t.entries) {
+    for (const e of startTurn.entries.slice(startIdx)) {
+      if (e.type === "message") {
+        segmentBC.push(e);
+      }
+    }
+    for (let i = fullStartTurn + 1; i <= fullEndTurn; i++) {
+      for (const e of turns[i].entries) {
         if (e.type === "message") {
           segmentBC.push(e);
         }
@@ -778,7 +833,12 @@ export async function executeCompact(
     // rejected — never silently dropped. The detection above is expected to
     // catch this first; this guard keeps any future gap from losing data.
     const rangeEntryIds = new Set(
-      segmentBCTurns.flatMap((t) => t.entries.map((e) => e.id as string)),
+      [
+        ...startTurn.entries.slice(startIdx),
+        ...turns
+          .slice(fullStartTurn + 1, fullEndTurn + 1)
+          .flatMap((t) => t.entries),
+      ].map((e) => e.id as string),
     );
     for (const b of branches) {
       if (rangeEntryIds.has(b.branchPointId)) {

@@ -227,3 +227,98 @@ test("deletion rebuild (no summary) also keeps a segment-D fork", async () => {
   assert.ok(t.includes("H") && t.includes("H2"), "branch kept in delete mode");
   assert.ok(!t.includes("B"), "range content dropped");
 });
+
+// ---- summary turn-boundary handling (the /distill up case) ----------------
+
+test("up-style range keeps the summary it starts after", async () => {
+  const { sm, msg } = makeSession();
+  const summary = (label: string) =>
+    sm.appendMessage({
+      role: "compactionSummary",
+      summary: `<distilled-summary turns="2" messages="3">${label}</distilled-summary>`,
+      tokensBefore: 10,
+      timestamp: Date.now(),
+    } as any);
+
+  const u1 = msg("user", "A");
+  const a1 = msg("assistant", "B");
+  const u2 = msg("user", "C");
+  const s1 = summary("S1");
+  const s2 = summary("S2");
+  // assistant replies that follow S2 belong to S2's turn
+  const d = msg("assistant", "D");
+  const e = msg("assistant", "E"); // leaf
+
+  const res = await executeCompact(
+    { startLabel: "[up] previous summary", startId: d, endId: e },
+    DROP_CONFIG as any,
+    ctxFor(sm),
+  );
+
+  assert.ok(
+    res.segmentA.some((x) => x.id === s2),
+    "S2 stays in segment A",
+  );
+  assert.ok(
+    !res.segmentBC.some((x) => x.id === s2),
+    "S2 must not be swallowed into the range",
+  );
+  assert.deepEqual(
+    res.segmentBC.map((x) => (x as any).id),
+    [d, e],
+    "range is exactly D..E",
+  );
+
+  const out = SessionManager.inMemory("out");
+  rebuildLinearRange(out as any, res, {
+    summaryContent: "<distilled-summary>NEW</distilled-summary>",
+  });
+  const summaries = (out.getEntries() as any[])
+    .filter((x) => x.type === "message" && x.message?.role === "compactionSummary")
+    .map((x) => x.message.summary);
+  assert.equal(summaries.length, 3, "S1 + S2 + NEW all present");
+  assert.match(summaries[0], /S1/);
+  assert.match(summaries[1], /S2/);
+  assert.match(summaries[2], /NEW/);
+});
+
+test("side-branch range keeps a summary turn boundary too", async () => {
+  const { sm, msg } = makeSession();
+  const summary = () =>
+    sm.appendMessage({
+      role: "compactionSummary",
+      summary: '<distilled-summary turns="2" messages="2">S</distilled-summary>',
+      tokensBefore: 10,
+      timestamp: Date.now(),
+    } as any);
+
+  const u1 = msg("user", "A");
+  const a1 = msg("assistant", "B");
+  // target branch: S → d → e
+  const s = summary();
+  const d = msg("assistant", "D");
+  const e = msg("assistant", "E");
+  // leaf elsewhere, so the target range is a side branch
+  sm.branch(a1);
+  msg("user", "O");
+  const o2 = msg("assistant", "O2");
+
+  const res = await executeCompact(
+    { startLabel: "[up] branch start", startId: d, endId: e },
+    DROP_CONFIG as any,
+    ctxFor(sm),
+  );
+
+  assert.ok(res.plan, "side-branch rebuild plan expected");
+  const summarySlot = res.plan!.find((p) => p.insertSummary);
+  assert.ok(summarySlot, "summary slot present");
+  // S must be copied as its own entry, not replaced by the slot
+  assert.ok(
+    res.plan!.some((p) => (p.entry as any).id === s && !p.insertSummary),
+    "S preserved in the plan",
+  );
+  assert.ok(
+    !res.plan!.some((p) => p.insertSummary && (p.entry as any).id === s),
+    "slot does not overwrite S",
+  );
+});
