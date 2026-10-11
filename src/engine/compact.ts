@@ -828,10 +828,15 @@ export async function executeCompact(
     // Collect branches that fork off the main path (preserved in new session)
     branches = collectBranches(allEntries, byId, fullPath);
 
-    // Invariant: a fork point inside the compressed range cannot be
-    // re-attached (its anchor is replaced by the summary), so it must be
-    // rejected — never silently dropped. The detection above is expected to
-    // catch this first; this guard keeps any future gap from losing data.
+    // Guard: a message-bearing branch whose fork point sits inside the
+    // compressed range cannot be re-attached (its anchor is replaced by the
+    // summary), so it must be rejected — never silently dropped. Detection
+    // above is expected to catch this first; this guard keeps any future gap
+    // from losing conversation data.
+    //
+    // Metadata-only forks (custom entries, labels) are deliberately ignored:
+    // they carry no LLM context and are dropped together with the rest of the
+    // in-range metadata, exactly like in-range custom entries on the path.
     const rangeEntryIds = new Set(
       [
         ...startTurn.entries.slice(startIdx),
@@ -841,7 +846,8 @@ export async function executeCompact(
       ].map((e) => e.id as string),
     );
     for (const b of branches) {
-      if (rangeEntryIds.has(b.branchPointId)) {
+      const carriesMessages = b.entries.some((e) => e.type === "message");
+      if (carriesMessages && rangeEntryIds.has(b.branchPointId)) {
         throw new Error(
           "Branch detected in range — not supported yet. Distill before/after the branch point separately.",
         );

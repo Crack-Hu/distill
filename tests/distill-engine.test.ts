@@ -322,3 +322,44 @@ test("side-branch range keeps a summary turn boundary too", async () => {
     "slot does not overwrite S",
   );
 });
+
+// ---- metadata-only forks inside the range must not block the operation ----
+
+test("metadata-only fork inside the range does not reject", async () => {
+  // Regression: a plan-mode-state custom entry plus a label hanging off a
+  // node inside the range used to trip the in-range branch guard, failing
+  // the whole distill/delete with "Branch detected in range".
+  const { sm, msg } = makeSession();
+  const u1 = msg("user", "A");
+  const a1 = msg("assistant", "B");
+  // off-path metadata siblings under B: a custom entry, then a label under it
+  sm.appendCustomEntry("plan-mode-state", {});
+  sm.appendLabelChange(a1, "tagB");
+  // main path continues from B
+  sm.branch(a1);
+  const u2 = msg("user", "C");
+  const a2 = msg("assistant", "D");
+
+  const res = await executeCompact(
+    { startLabel: "B", startId: a1, endId: a2, endLabelDesc: "D" },
+    DROP_CONFIG as any,
+    ctxFor(sm),
+  );
+
+  // The range compresses; the metadata fork is collected but carries no
+  // messages, so it must not throw and must not be treated as data loss.
+  assert.ok(res.segmentBC.length >= 2, "range compresses");
+  const meta = res.branches.find((b) => b.branchPointId === a1);
+  assert.ok(meta, "metadata fork is collected");
+  assert.ok(
+    !meta!.entries.some((e) => e.type === "message"),
+    "metadata fork carries no messages",
+  );
+
+  const out = SessionManager.inMemory("out");
+  rebuildLinearRange(out as any, res, { summaryContent: SUMMARY });
+  assert.ok(
+    (out.getEntries() as any[]).some((e) => e.type === "message"),
+    "rebuild succeeds",
+  );
+});
