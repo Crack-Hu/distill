@@ -136,34 +136,6 @@ function hasOffPathMessageDescendant(
   );
 }
 
-function hasBranchInRange(
-  allEntries: Array<Record<string, unknown>>,
-  byId: Map<string, Record<string, unknown>>,
-  startId: string,
-  endId: string,
-  fullPathIds: Set<string>,
-): boolean {
-  let current: Record<string, unknown> | undefined = byId.get(endId);
-  const pathIds = new Set<string>();
-  while (current && !pathIds.has(current.id as string)) {
-    pathIds.add(current.id as string);
-    if ((current.id as string) === startId) break;
-    current = byId.get((current.parentId as string) ?? "");
-  }
-  pathIds.add(startId);
-
-  // A child that continues the main path (root → leaf) past endId is
-  // segmentD, not a fork — only off-path message branches count. Walking the
-  // whole off-path subtree (rather than direct message children only) keeps
-  // this check in agreement with collectBranches().
-  for (const id of pathIds) {
-    if (hasOffPathMessageDescendant(allEntries, byId, fullPathIds, id)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 // ---- branch collection ---------------------------------------------------
 
 export interface BranchData {
@@ -490,6 +462,12 @@ interface CompactResult {
   /** Branches that fork off the main path (any point on it). */
   branches: BranchData[];
   /**
+   * True when the range contains a conversation branch that forks off inside
+   * it. Its anchor is replaced by the summary, so the branch is left behind in
+   * the old session — callers must keep that session (no in-place rebuild).
+   */
+  rangeHasBranches: boolean;
+  /**
    * Whole-tree rebuild plan (side-branch ranges). When set, segmentA/D and
    * branches are empty — the plan carries the full DFS order plus the parent
    * each entry is re-attached under. `insertSummary` marks the slot where a
@@ -664,6 +642,7 @@ export async function executeCompact(
   let branches: BranchData[] = [];
   let turnCount = 0;
   let plan: PlanEntry[] | undefined;
+  let rangeHasBranches = false;
   let effectiveStartId = startId;
   let effectiveEndId = endId;
 
@@ -752,14 +731,10 @@ export async function executeCompact(
     plan = buildRebuildPlan(allEntries, bcIds, true);
   } else {
     // ---- main-path range ----
-    // Branch check — reject if branches inside compressed range. Children
-    // that continue the main path (root → leaf) past endId are segmentD.
-    if (hasBranchInRange(allEntries, byId, startId, endId, fullPathIds)) {
-      throw new Error(
-        "Branch detected in range — not supported yet. Distill before/after the branch point separately.",
-      );
-    }
-
+    // Ranges that contain a fork are compressible: the fork cannot be
+    // re-attached (its anchor becomes the summary), so that branch is left in
+    // the old session and reported via `rangeHasBranches`. Callers must keep
+    // the old session in that case — never replace it in place.
     effectiveStartId = snapToMessageOn(fullPath, startId, "forward");
     effectiveEndId = snapToMessageOn(fullPath, endId, "backward");
 
@@ -825,18 +800,9 @@ export async function executeCompact(
     // Number of conversation turns inside the compressed range.
     turnCount = fullEndTurn - fullStartTurn + 1;
 
-    // Collect branches that fork off the main path (preserved in new session)
-    branches = collectBranches(allEntries, byId, fullPath);
-
-    // Guard: a message-bearing branch whose fork point sits inside the
-    // compressed range cannot be re-attached (its anchor is replaced by the
-    // summary), so it must be rejected — never silently dropped. Detection
-    // above is expected to catch this first; this guard keeps any future gap
-    // from losing conversation data.
-    //
-    // Metadata-only forks (custom entries, labels) are deliberately ignored:
-    // they carry no LLM context and are dropped together with the rest of the
-    // in-range metadata, exactly like in-range custom entries on the path.
+    // Collect branches that fork off the main path. Forks inside the range
+    // cannot be re-attached (their anchor is replaced by the summary): those
+    // stay in the old session and only the surviving ones are carried over.
     const rangeEntryIds = new Set(
       [
         ...startTurn.entries.slice(startIdx),
@@ -845,14 +811,16 @@ export async function executeCompact(
           .flatMap((t) => t.entries),
       ].map((e) => e.id as string),
     );
-    for (const b of branches) {
-      const carriesMessages = b.entries.some((e) => e.type === "message");
-      if (carriesMessages && rangeEntryIds.has(b.branchPointId)) {
-        throw new Error(
-          "Branch detected in range — not supported yet. Distill before/after the branch point separately.",
-        );
-      }
-    }
+    const collected = collectBranches(allEntries, byId, fullPath);
+    branches = collected.filter((b) => !rangeEntryIds.has(b.branchPointId));
+    // Metadata-only forks (custom entries, labels) are not conversation data:
+    // they are dropped together with the rest of the in-range metadata, so
+    // they do not force the old session to be kept.
+    rangeHasBranches = collected.some(
+      (b) =>
+        rangeEntryIds.has(b.branchPointId) &&
+        b.entries.some((e) => e.type === "message"),
+    );
   }
 
   // Get background messages
@@ -873,6 +841,7 @@ export async function executeCompact(
       turnCount,
       branches,
       plan,
+      rangeHasBranches,
     };
   }
 
@@ -925,5 +894,6 @@ export async function executeCompact(
     turnCount,
     branches,
     plan,
+    rangeHasBranches,
   };
 }

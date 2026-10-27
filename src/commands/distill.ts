@@ -124,12 +124,24 @@ function reportDistillError(
 }
 
 /**
- * Ask how to handle the old session. Returns `{ markOld: true }` (keep as
- * [distilled]), `{ markOld: false }` (trash it), or null when cancelled.
+ * Ask how to handle the old session. Returns `true` (keep it as [distilled]),
+ * `false` (trash it in place), or null when cancelled.
+ *
+ * With `forceNew`, in-place replacement is not offered: the compressed range
+ * left a conversation branch behind, which only survives in the old session.
  */
-async function promptSessionMethod(
+export async function promptSessionMethod(
   ctx: ExtensionCommandContext,
+  opts?: { forceNew?: boolean },
 ): Promise<boolean | null> {
+  if (opts?.forceNew) {
+    const choice = await ctx.ui.select(
+      "Session method — in-place unavailable: the range contains a branch that stays in the old session",
+      [SESSION_METHOD.NEW, CANCEL],
+    );
+    if (choice === undefined || choice === CANCEL) return null;
+    return true;
+  }
   const options = [SESSION_METHOD.NEW, SESSION_METHOD.IN_PLACE, CANCEL];
   const choice = await ctx.ui.select("Session method", options);
   if (choice === undefined || choice === CANCEL) return null;
@@ -289,7 +301,11 @@ async function runCompactAndRebuild(params: RunCompactParams): Promise<void> {
     // Non-fatal: fall back to a root session.
   }
   // Ask the user how to handle the old session (same as delete / merge).
-  const markOld = await promptSessionMethod(ctx);
+  // When the range left a branch behind, only a new session is safe: the old
+  // one is the only place that branch still exists.
+  const markOld = await promptSessionMethod(ctx, {
+    forceNew: result.rangeHasBranches,
+  });
   if (markOld === null) return; // user cancelled
 
   // Create replacement session, reconstructing branches from the old tree
@@ -349,7 +365,9 @@ async function runCompactAndRebuild(params: RunCompactParams): Promise<void> {
       cwd,
       sessionDir,
       markOld,
-      doneMessage: "✅ Distilled",
+      doneMessage: result.rangeHasBranches
+        ? "✅ Distilled — a branch inside the range stays in the old session"
+        : "✅ Distilled",
     }),
   });
 }
@@ -671,6 +689,10 @@ async function deleteAsNewSession(
   config: DistillConfig,
   markOld: boolean,
 ): Promise<void> {
+  // A branch left inside the range exists only in the old session, so the
+  // rebuild must keep it — in-place replacement is never allowed here.
+  const keepOldSession = markOld || result.rangeHasBranches;
+
   // Capture old session metadata before creating the replacement
   const oldSessionFile = ctx.sessionManager.getSessionFile();
   const oldTitle = ctx.sessionManager.getSessionName();
@@ -691,7 +713,7 @@ async function deleteAsNewSession(
   await ctx.newSession({
     // Keep the old session's position unless the old session is kept and
     // re-parented under the new one (new-session mode).
-    parentSession: markOld ? undefined : oldParentSession,
+    parentSession: keepOldSession ? undefined : oldParentSession,
     setup: async (sm) => {
       // Whole-tree rebuild: copy every entry in DFS order except the deleted
       // turn; each entry is appended under its (remapped) parent. The deleted
@@ -716,8 +738,12 @@ async function deleteAsNewSession(
       oldTitle,
       cwd,
       sessionDir,
-      markOld,
-      doneMessage: markOld ? "✅ Deleted (new session)" : "✅ Deleted in place",
+      markOld: keepOldSession,
+      doneMessage: result.rangeHasBranches
+        ? "✅ Deleted — a branch inside the range stays in the old session"
+        : keepOldSession
+          ? "✅ Deleted (new session)"
+          : "✅ Deleted in place",
     }),
   });
 }
@@ -1022,6 +1048,7 @@ async function deleteSingleEntry(
       turnCount: 1,
       branches: [],
       plan,
+      rangeHasBranches: false,
     },
     ctx,
     config,
@@ -1070,17 +1097,18 @@ async function handleDelete(
       single = how === "This turn only";
     }
 
-    // Step 2 — old session handling (both granularities share this).
-    const markOld = await promptSessionMethod(ctx);
-    if (markOld === null) return; // user cancelled
-
+    // Step 2 — old session handling. Single-turn deletions rebuild from an
+    // in-memory plan (no compact run), so the method can be asked up front.
     if (single) {
+      const markOld = await promptSessionMethod(ctx);
+      if (markOld === null) return; // user cancelled
       await deleteSingleEntry(range.startId, ctx, config, markOld);
       return;
     }
 
-    // Range deletion: rebuild via newSession; the only difference between
-    // the two options is whether the old session is marked as distilled.
+    // Range deletion: compute the segments first, so the session-method
+    // prompt can hide the in-place option when a branch inside the range
+    // would be left behind in the old session.
     const result = await executeCompact(
       {
         startLabel: label,
@@ -1090,6 +1118,10 @@ async function handleDelete(
       { ...config, drop: true },
       ctx,
     );
+    const markOld = await promptSessionMethod(ctx, {
+      forceNew: result.rangeHasBranches,
+    });
+    if (markOld === null) return; // user cancelled
     await deleteAsNewSession(result, ctx, config, markOld);
   } catch (err) {
     reportDistillError(ctx, err, "Delete");
@@ -1570,9 +1602,14 @@ async function handleDistillMerge(
       false,
     );
 
-    // Old session handling — same two-step as delete/merge.
-    const markOld = await promptSessionMethod(ctx);
+    // Old session handling — same two-step as delete/merge. A branch left
+    // inside the range survives only in the old session, so in-place is not
+    // offered in that case.
+    const markOld = await promptSessionMethod(ctx, {
+      forceNew: result.rangeHasBranches,
+    });
     if (markOld === null) return; // user cancelled
+    const keepOldSession = markOld || result.rangeHasBranches;
 
     // Capture old session metadata before creating the replacement
     const oldSessionFile = ctx.sessionManager.getSessionFile();
@@ -1591,7 +1628,7 @@ async function handleDistillMerge(
     }
 
     await ctx.newSession({
-      parentSession: markOld ? undefined : oldParentSession,
+      parentSession: keepOldSession ? undefined : oldParentSession,
       setup: async (sm2) => {
         const summaryContent = makeSummaryContent(
           result.turnCount,
@@ -1636,8 +1673,10 @@ async function handleDistillMerge(
         oldTitle,
         cwd,
         sessionDir,
-        markOld,
-        doneMessage: "✅ Branch summarized and merged",
+        markOld: keepOldSession,
+        doneMessage: result.rangeHasBranches
+          ? "✅ Branch summarized and merged — a branch inside the range stays in the old session"
+          : "✅ Branch summarized and merged",
       }),
     });
   } catch (err) {

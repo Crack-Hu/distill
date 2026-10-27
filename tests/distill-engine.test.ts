@@ -14,7 +14,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { executeCompact } from "../src/engine/compact";
-import { rebuildLinearRange } from "../src/commands/distill";
+import { promptSessionMethod, rebuildLinearRange } from "../src/commands/distill";
 
 // ---- helpers --------------------------------------------------------------
 
@@ -57,11 +57,11 @@ function texts(sm: SessionManager): string[] {
     .filter((t) => typeof t === "string");
 }
 
-const BRANCH_ERR = /Branch detected in range/;
-
 // ---- detection: in-range forks must be rejected ---------------------------
 
-test("rejects a direct fork on the range end", async () => {
+test("a message fork on the range end is allowed and flagged", async () => {
+  // Ranges containing a fork are compressible; the branch cannot be
+  // re-attached, so it stays in the old session (rangeHasBranches = true).
   const { sm, msg } = makeSession();
   const u1 = msg("user", "A");
   const a1 = msg("assistant", "B");
@@ -72,17 +72,19 @@ test("rejects a direct fork on the range end", async () => {
   sm.branch(a2);
   msg("assistant", "F");
 
-  await assert.rejects(
-    executeCompact(
-      { startLabel: "B", startId: a1, endId: a2, endLabelDesc: "E" },
-      DROP_CONFIG as any,
-      ctxFor(sm),
-    ),
-    BRANCH_ERR,
+  const res = await executeCompact(
+    { startLabel: "B", startId: a1, endId: a2, endLabelDesc: "E" },
+    DROP_CONFIG as any,
+    ctxFor(sm),
+  );
+  assert.equal(res.rangeHasBranches, true, "branch inside the range is reported");
+  assert.ok(
+    res.branches.every((b) => b.branchPointId !== a2),
+    "the in-range fork is not carried over",
   );
 });
 
-test("rejects a fork that hangs off the range end via a label", async () => {
+test("a fork behind a label on the range end is detected and flagged", async () => {
   const { sm, msg } = makeSession();
   const u1 = msg("user", "A");
   const a1 = msg("assistant", "B");
@@ -95,17 +97,15 @@ test("rejects a fork that hangs off the range end via a label", async () => {
   sm.branch(a2);
   msg("assistant", "F");
 
-  await assert.rejects(
-    executeCompact(
-      { startLabel: "B", startId: a1, endId: a2, endLabelDesc: "E" },
-      DROP_CONFIG as any,
-      ctxFor(sm),
-    ),
-    BRANCH_ERR,
+  const res = await executeCompact(
+    { startLabel: "B", startId: a1, endId: a2, endLabelDesc: "E" },
+    DROP_CONFIG as any,
+    ctxFor(sm),
   );
+  assert.equal(res.rangeHasBranches, true, "fork behind a label is still found");
 });
 
-test("rejects a fork that hangs off the range end via a custom entry", async () => {
+test("a fork behind a custom entry on the range end is detected and flagged", async () => {
   const { sm, msg } = makeSession();
   const u1 = msg("user", "A");
   const a1 = msg("assistant", "B");
@@ -117,14 +117,12 @@ test("rejects a fork that hangs off the range end via a custom entry", async () 
   sm.branch(a2);
   msg("assistant", "F");
 
-  await assert.rejects(
-    executeCompact(
-      { startLabel: "B", startId: a1, endId: a2, endLabelDesc: "E" },
-      DROP_CONFIG as any,
-      ctxFor(sm),
-    ),
-    BRANCH_ERR,
+  const res = await executeCompact(
+    { startLabel: "B", startId: a1, endId: a2, endLabelDesc: "E" },
+    DROP_CONFIG as any,
+    ctxFor(sm),
   );
+  assert.equal(res.rangeHasBranches, true, "fork behind a custom entry is found");
 });
 
 test("metadata-only custom entry inside the range does not reject", async () => {
@@ -346,14 +344,14 @@ test("metadata-only fork inside the range does not reject", async () => {
     ctxFor(sm),
   );
 
-  // The range compresses; the metadata fork is collected but carries no
-  // messages, so it must not throw and must not be treated as data loss.
+  // The range compresses; the metadata-only fork carries no messages, so it
+  // is not conversation data: in-place stays available and nothing is
+  // carried over (it is dropped with the rest of the in-range metadata).
   assert.ok(res.segmentBC.length >= 2, "range compresses");
-  const meta = res.branches.find((b) => b.branchPointId === a1);
-  assert.ok(meta, "metadata fork is collected");
+  assert.equal(res.rangeHasBranches, false, "metadata fork is not data loss");
   assert.ok(
-    !meta!.entries.some((e) => e.type === "message"),
-    "metadata fork carries no messages",
+    res.branches.every((b) => b.branchPointId !== a1),
+    "in-range metadata fork is not carried over",
   );
 
   const out = SessionManager.inMemory("out");
@@ -362,4 +360,69 @@ test("metadata-only fork inside the range does not reject", async () => {
     (out.getEntries() as any[]).some((e) => e.type === "message"),
     "rebuild succeeds",
   );
+});
+
+// ---- session-method prompt and two-tag fork ranges -------------------------
+
+test("forceNew hides the in-place option", async () => {
+  const calls: Array<{ title: string; options: string[] }> = [];
+  const makeCtx = (pick: number) =>
+    ({
+      ui: {
+        select: async (title: string, options: string[]) => {
+          calls.push({ title, options });
+          return options[pick];
+        },
+        theme: { fg: (_: string, s: string) => s },
+      },
+    }) as any;
+
+  const forced = await promptSessionMethod(makeCtx(0), { forceNew: true });
+  assert.equal(forced, true, "new session chosen");
+  assert.deepEqual(
+    calls[0].options,
+    ["New session (keep old as distilled)", "Cancel"],
+    "no in-place option offered",
+  );
+  assert.match(calls[0].title, /in-place unavailable/);
+
+  calls.length = 0;
+  const normal = await promptSessionMethod(makeCtx(1), {});
+  assert.equal(normal, false, "in-place chosen when offered");
+  assert.equal(calls[0].options.length, 3, "in-place still offered normally");
+});
+
+test("two-tag range with a fork at the end tag is allowed (new session only)", async () => {
+  // Mirrors the reported session: range A..B where B forks into another line.
+  const { sm, msg } = makeSession();
+  const a = msg("user", "A");
+  const b = msg("assistant", "B");
+  // another line forks off B; the main path continues with C
+  const fork = msg("user", "F-branch");
+  const forkReply = msg("assistant", "F-reply");
+  sm.branch(b);
+  const c = msg("user", "C");
+  const cReply = msg("assistant", "C-reply");
+
+  const res = await executeCompact(
+    { startLabel: "tag", startId: a, endId: b, endLabelDesc: "the second tag" },
+    DROP_CONFIG as any,
+    ctxFor(sm),
+  );
+  assert.equal(res.rangeHasBranches, true, "fork at the end tag is flagged");
+  assert.ok(
+    res.branches.every((x) => x.branchPointId !== b),
+    "in-range fork is not carried over",
+  );
+
+  const out = SessionManager.inMemory("out");
+  rebuildLinearRange(out as any, res, { summaryContent: SUMMARY });
+  const t = texts(out);
+  assert.ok(t.includes("C") && t.includes("C-reply"), "continuation kept");
+  assert.ok(
+    !t.includes("F-branch") && !t.includes("F-reply"),
+    "left-behind line stays in the old session",
+  );
+  void fork;
+  void forkReply;
 });
