@@ -78,12 +78,34 @@ export interface CompactRange {
   supplement?: string;
 }
 
+/**
+ * OpenAI-compatible LLM endpoint used by /suggest-label. Kept separate from
+ * `summaryModel` (which resolves through pi's model registry) so label
+ * suggestion can target a cheap model with its own key.
+ */
+export interface SuggestLlmConfig {
+  /** Base URL without the trailing /chat/completions, e.g. https://api.deepseek.com */
+  baseUrl: string;
+  model: string;
+  /** Environment variable holding the API key (preferred). */
+  apiKeyEnv?: string;
+  /** Inline API key fallback; prefer apiKeyEnv to avoid committing secrets. */
+  apiKey?: string;
+  temperature?: number;
+  maxTokens?: number;
+  timeoutMs?: number;
+  /** Per-message character cap for the compact transcript sent to the LLM. */
+  maxCharsPerMessage?: number;
+}
+
 export interface DistillConfig {
   autoClean: boolean;
   summaryModel: string;
   contextOn: boolean;
   /** Skip summary generation and simply drop the compressed range. */
   drop: boolean;
+  /** LLM endpoint for /suggest-label (optional; the command errors without it). */
+  suggest?: SuggestLlmConfig;
 }
 
 // ---- range helpers -------------------------------------------------------

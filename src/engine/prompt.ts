@@ -59,7 +59,7 @@ function loadAppendTemplate(): string {
  * empty, the heading line above it is dropped too, so empty sections vanish.
  * Placeholders inside a line are replaced textually.
  */
-function renderTemplate(template: string, values: Record<string, string>): string {
+export function renderTemplate(template: string, values: Record<string, string>): string {
   const lines = template.split("\n");
   const rendered: string[] = [];
   for (const line of lines) {
@@ -94,7 +94,7 @@ interface ToolCallBlock {
 
 type ContentBlock = TextBlock | ToolCallBlock;
 
-function extractText(content: unknown): string {
+export function extractText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
 

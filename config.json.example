@@ -1,0 +1,14 @@
+{
+  "autoClean": false,
+  "summaryModel": "inherit",
+  "contextOn": false,
+  "suggest": {
+    "baseUrl": "https://api.deepseek.com",
+    "model": "deepseek-flash",
+    "apiKeyEnv": "DEEPSEEK_API_KEY_PI",
+    "temperature": 0.2,
+    "maxTokens": 2048,
+    "timeoutMs": 60000,
+    "maxCharsPerMessage": 800
+  }
+}

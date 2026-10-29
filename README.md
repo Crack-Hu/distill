@@ -57,6 +57,69 @@ pi install https://github.com/Crack-Hu/distill
 | `/distill model` | 选择摘要生成模型（从 pi 已注册模型） |
 | `/distill clean [all]` | 回收当前项目的 `[distilled]` 旧会话到 trash；加 `all` 回收所有项目 |
 | `/distill fork <path> [message]` | 从蒸馏会话 fork 出新会话继续工作 |
+| `/suggest-label [提示]` | 让 LLM 根据任务逻辑建议一个标签位置 |
+
+---
+
+## AI 标签建议（/suggest-label）
+
+手动在 `/tree` 里逐个 `shift+L` 打标比较繁琐。`/suggest-label` 会让 LLM 阅读当前分支，按**工作任务逻辑**建议一个标签位置：
+
+```
+/suggest-label [可选提示，例如：重点标出调试阶段]
+```
+
+发送给 LLM 的不是完整对话，而是一份精简记录，以控制 token：
+
+- 每条 **user 消息**保留原文（超过 `maxCharsPerMessage` 时截断）
+- 每轮只保留 **AI 最后一条文本回复**，中间的 tool call / tool result 全部省略
+- 之前的摘要只保留一个占位符，不发送摘要正文
+- 只分析**当前分支**：从当前 leaf 沿 `parentId` 回溯到根节点，旁支不参与
+
+LLM 只返回目标 turn 和 2-4 句说明；标签名由扩展自动生成 `suggest-1`、`suggest-2`…（扫描会话中已有的 `suggest-N` 后取下一个编号）。
+
+前端会展示位置和理由，并给出三个选项：
+
+- **Accept** — 只写入标签，之后可手动执行 `/distill <label>`
+- **Accept and distill** — 写入标签并立即进入正常的压缩流程（摘要确认、旧会话处理）
+- **Reject** — 不修改会话
+
+已有标签不会交给 LLM 处理。如果目标 turn 已经有标签，会在你选择 Accept / Accept and distill 后弹窗提醒，确认后才覆盖。
+
+标签通过 pi 原生 label API 写入，与 `/tree` 里 `shift+L` 的结果一致。
+
+### 配置
+
+该命令使用独立的 OpenAI 兼容端点，不经过 pi 的模型注册表。在项目配置 `<cwd>/.pi/distill/config.json` 中加入：
+
+```json
+{
+  "suggest": {
+    "baseUrl": "https://api.deepseek.com",
+    "model": "deepseek-flash",
+    "apiKeyEnv": "DEEPSEEK_API_KEY_PI",
+    "temperature": 0.2,
+    "maxTokens": 2048,
+    "timeoutMs": 60000,
+    "maxCharsPerMessage": 800
+  }
+}
+```
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `baseUrl` | （必填） | OpenAI 兼容端点；代码会拼接 `/chat/completions` |
+| `model` | （必填） | 模型名 |
+| `apiKeyEnv` | — | 存放 API key 的环境变量名（推荐） |
+| `apiKey` | — | 直接写 key（不推荐提交） |
+| `temperature` | `0.2` | 采样温度 |
+| `maxTokens` | `2048` | 最大输出 token；推理模型需要留足余量 |
+| `timeoutMs` | `60000` | 请求超时 |
+| `maxCharsPerMessage` | `800` | 单条消息截断长度 |
+
+仓库根目录的 `config.json.example` 是完整模板。建议把它复制到 `<cwd>/.pi/distill/config.json`，并把 `apiKeyEnv` 指向你环境中的变量（例如 `DEEPSEEK_API_KEY_PI`）。
+
+> 与 `summaryModel` 的区别：`summaryModel` 走 pi 已注册模型；`suggest` 是独立的 OpenAI 兼容配置，便于给打标任务使用更便宜/更快的模型。
 
 ---
 
@@ -248,6 +311,6 @@ Step 2  Session method
 ## 已知限制 / 取舍
 
 - **压缩范围含分支点**：压缩后分支无法随新会话带走（它仍留在旧 `[distilled]` 会话里），因此这类范围仅允许"新建会话"；需要在分支点前后分别压缩时请手动打标签
-- **标签名 "del"**：`/distill del` 单独使用会把 `del` 当作标签名处理，因此名为 `del` 的标签无法通过删除命令触发压缩（语法歧义的取舍）
+- **标签名与子命令同名**：`del`、`up`、`merge`、`clean`、`model`、`fork`、`context`、`auto-clean` 会被 `/distill` 解析成子命令，因此这些标签无法通过 `/distill <label>` 触发压缩（语法歧义的取舍；`/suggest-label` 会自动给这类名字加后缀）
 - **append-only 模型**：旧会话文件不物理删除，而是保留标记或移入 `<cwd>/.pi/distill/trash/`（`/distill clean [all]` 只负责回收，清空需手动删除 trash 文件）
 - **单删第一轮**：树根所在的第一轮不允许单独删除（无前置内容可衔接）

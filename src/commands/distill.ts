@@ -59,11 +59,11 @@ function defaultConfig(): DistillConfig {
  * Load the project-local config (`<cwd>/.pi/distill/config.json`); missing or
  * malformed files fall back to defaults without writing anything.
  */
-function loadConfig(cwd: string): DistillConfig {
+export function loadConfig(cwd: string): DistillConfig {
   const path = configPathFor(cwd);
   try {
     if (existsSync(path)) {
-      return JSON.parse(readFileSync(path, "utf8"));
+      return { ...defaultConfig(), ...JSON.parse(readFileSync(path, "utf8")) };
     }
   } catch {
     // fall through to defaults
@@ -99,7 +99,7 @@ async function showSummaryAndConfirm(
 
 // ---- shared distill flow --------------------------------------------------
 
-interface RunCompactParams {
+export interface RunCompactParams {
   startLabel: string;
   startId: string;
   endId: string;
@@ -107,10 +107,17 @@ interface RunCompactParams {
   supplement?: string;
   config: DistillConfig;
   ctx: ExtensionCommandContext;
+  /**
+   * Leaf to restore after a whole-tree rebuild. Defaults to the live leaf;
+   * callers that appended a label just before distilling can pass the
+   * pre-label leaf so the new session does not try to restore the label
+   * entry (which is not part of the rebuild plan).
+   */
+  restoreLeafId?: string;
 }
 
 /** Report a flow error, canonicalizing the user-cancel case. */
-function reportDistillError(
+export function reportDistillError(
   ctx: ExtensionCommandContext,
   err: unknown,
   operation = "Distill",
@@ -257,7 +264,7 @@ function makeSummaryContent(
  * Runs the compact engine, shows the summary for confirmation, and rebuilds
  * the session. Shared by the label-based flow and `/distill auto`.
  */
-async function runCompactAndRebuild(params: RunCompactParams): Promise<void> {
+export async function runCompactAndRebuild(params: RunCompactParams): Promise<void> {
   const {
     startLabel,
     startId,
@@ -287,7 +294,7 @@ async function runCompactAndRebuild(params: RunCompactParams): Promise<void> {
   // Capture old session metadata before creating the replacement
   const oldSessionFile = ctx.sessionManager.getSessionFile();
   const oldTitle = ctx.sessionManager.getSessionName();
-  const oldLeafId = ctx.sessionManager.getLeafId();
+  const oldLeafId = params.restoreLeafId ?? ctx.sessionManager.getLeafId();
   const sessionDir = ctx.sessionManager.getSessionDir();
   const cwd = ctx.cwd;
 
@@ -870,7 +877,7 @@ async function pickLabelCandidate(
  *
  * Returns null when the user cancels.
  */
-async function resolveRange(
+export async function resolveRange(
   args: { startLabel: string },
   ctx: ExtensionCommandContext,
 ): Promise<{ startId: string; endId: string; pair: boolean } | null> {
