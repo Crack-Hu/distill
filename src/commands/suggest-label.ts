@@ -1,5 +1,5 @@
 /**
- * /suggest-label — ask an LLM where to place the next distill label.
+ * /distill suggest_lab — ask an LLM where to place the next distill label.
  *
  * The transcript is intentionally compact: user messages plus the final
  * assistant text of each turn, with tool output omitted and summaries
@@ -14,6 +14,7 @@ import type {
 
 import type { SuggestLlmConfig } from "../engine/compact";
 import { configPathFor } from "../engine/session-io";
+import { ProgressDialog } from "../ui/progress";
 import {
   buildSuggestPrompt,
   buildSuggestTranscript,
@@ -22,11 +23,9 @@ import {
   requestSuggestion,
   type LabelSuggestion,
 } from "../engine/suggest";
-import {
-  loadConfig,
-  reportDistillError,
-  resolveRange,
-  runCompactAndRebuild,
+import type {
+  DistillConfig,
+  RunCompactParams,
 } from "./distill";
 
 const CHOICES = {
@@ -41,13 +40,14 @@ function errorMessage(error: unknown): string {
 
 function missingConfigMessage(cwd: string): string {
   return [
-    "Missing LLM config for /suggest-label.",
+    "Missing LLM config for /distill suggest_lab.",
     `Add a "suggest" block to ${configPathFor(cwd)} (template: config.json.example):`,
     "",
     '"suggest": {',
     '  "baseUrl": "https://api.deepseek.com",',
     '  "model": "deepseek-flash",',
-    '  "apiKeyEnv": "DEEPSEEK_API_KEY_PI"',
+    '  "apiKeyEnv": "DEEPSEEK_API_KEY_PI",',
+    '  "thinking": "disabled"',
     "}",
   ].join("\n");
 }
@@ -72,6 +72,55 @@ function applyLabel(
   }
 }
 
+/**
+ * Run the suggestion request behind the same cancellable overlay used by
+ * summary generation. Returns undefined when the user presses Esc.
+ */
+async function requestSuggestionWithCancel(
+  prompt: string,
+  config: SuggestLlmConfig,
+  ctx: ExtensionCommandContext,
+): Promise<string | undefined> {
+  const controller = new AbortController();
+  const generation = requestSuggestion(prompt, config, ctx.cwd, controller.signal);
+
+  if (!ctx.hasUI) return generation;
+
+  const outcome = await ctx.ui.custom<"done" | "cancel">(
+    (tui, theme, keybindings, done) =>
+      new ProgressDialog(
+        tui,
+        theme,
+        keybindings,
+        generation,
+        {
+          title: "Suggesting a label",
+          message: "Analyzing the conversation…",
+          modelLabel: config.model,
+        },
+        done,
+      ),
+    {
+      overlay: true,
+      // Overlays are NOT focused by default (pi only setFocus()es non-overlay
+      // components) — without this the Esc key goes to the editor.
+      onHandle: (handle) => handle.focus(),
+      overlayOptions: {
+        width: ProgressDialog.BOX_W,
+      },
+    },
+  );
+
+  if (outcome === "cancel") {
+    controller.abort();
+    // Wait for the request to settle so nothing keeps running after the
+    // overlay is gone.
+    await generation.catch(() => {});
+    return undefined;
+  }
+  return generation;
+}
+
 function suggestionTitle(
   suggestion: Extract<LabelSuggestion, { kind: "label" }>,
   label: string,
@@ -86,12 +135,27 @@ function suggestionTitle(
   ].join("\n");
 }
 
-async function handleSuggestLabel(
+export interface SuggestLabelDeps {
+  config: DistillConfig;
+  runCompactAndRebuild: (params: RunCompactParams) => Promise<void>;
+  resolveRange: (
+    args: { startLabel: string },
+    ctx: ExtensionCommandContext,
+  ) => Promise<{ startId: string; endId: string; pair: boolean } | null>;
+  reportDistillError: (
+    ctx: ExtensionCommandContext,
+    err: unknown,
+    operation?: string,
+  ) => void;
+}
+
+export async function handleSuggestLabel(
   pi: ExtensionAPI,
   args: string,
   ctx: ExtensionCommandContext,
+  deps: SuggestLabelDeps,
 ): Promise<void> {
-  const config = loadConfig(ctx.cwd);
+  const config = deps.config;
   const suggestConfig = config.suggest;
   if (!isConfigured(suggestConfig)) {
     ctx.ui.notify(missingConfigMessage(ctx.cwd), "error");
@@ -110,16 +174,17 @@ async function handleSuggestLabel(
   const prompt = buildSuggestPrompt(transcript, hint);
   const label = nextSuggestLabelName(transcript.existingLabels);
 
-  ctx.ui.setStatus("distill-suggest", "Asking LLM for a label suggestion…");
   let suggestion: LabelSuggestion;
   try {
-    const raw = await requestSuggestion(prompt, suggestConfig, ctx.cwd);
+    const raw = await requestSuggestionWithCancel(prompt, suggestConfig, ctx);
+    if (raw === undefined) {
+      ctx.ui.notify("Label suggestion cancelled.", "warning");
+      return;
+    }
     suggestion = parseSuggestion(raw, transcript.turns);
   } catch (error) {
     ctx.ui.notify(errorMessage(error), "error");
     return;
-  } finally {
-    ctx.ui.setStatus("distill-suggest", undefined);
   }
 
   if (suggestion.kind === "none") {
@@ -179,9 +244,9 @@ async function handleSuggestLabel(
   // Accept and distill: reuse the normal label→current flow, including its
   // summary review and session-method prompt.
   try {
-    const range = await resolveRange({ startLabel: label }, ctx);
+    const range = await deps.resolveRange({ startLabel: label }, ctx);
     if (!range) return;
-    await runCompactAndRebuild({
+    await deps.runCompactAndRebuild({
       startLabel: label,
       startId: range.startId,
       endId: range.endId,
@@ -191,20 +256,6 @@ async function handleSuggestLabel(
       restoreLeafId: preLabelLeafId,
     });
   } catch (error) {
-    reportDistillError(ctx, error);
+    deps.reportDistillError(ctx, error);
   }
-}
-
-/**
- * Register the LLM-assisted label suggestion command.
- */
-export function registerSuggestLabelCommand(pi: ExtensionAPI): void {
-  const description =
-    "Suggest one distill label position with an LLM (compact transcript), then Accept, Accept and distill, or Reject";
-
-  const handler = async (args: string, ctx: ExtensionCommandContext) => {
-    await handleSuggestLabel(pi, args, ctx);
-  };
-
-  pi.registerCommand("suggest-label", { description, handler });
 }

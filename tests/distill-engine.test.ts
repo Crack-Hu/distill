@@ -20,7 +20,7 @@ import { promptSessionMethod, rebuildLinearRange } from "../src/commands/distill
 
 const DROP_CONFIG = {
   autoClean: false,
-  summaryModel: "inherit",
+  distill_model: "inherit",
   contextOn: false,
   drop: true,
 } as const;

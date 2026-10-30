@@ -303,6 +303,145 @@ function chatCompletionsUrl(baseUrl: string): string {
 }
 
 /**
+ * Build the `/models` URL for a configured OpenAI-compatible base URL.
+ * Exported for tests; accepts both a base URL and a full completions URL.
+ */
+export function modelsUrl(baseUrl: string): string {
+  const base = baseUrl
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/chat\/completions$/i, "");
+  return `${base}/models`;
+}
+
+interface ModelsResponse {
+  data?: Array<{ id?: unknown }>;
+  error?: { message?: string };
+}
+
+/** Extract model IDs from an OpenAI-compatible `/models` payload. */
+export function parseModelIds(payload: unknown): string[] {
+  const data = (payload as ModelsResponse | undefined)?.data;
+  if (!Array.isArray(data)) return [];
+  const ids = data
+    .map((entry) =>
+      typeof entry?.id === "string" ? entry.id.trim() : "",
+    )
+    .filter(Boolean);
+  return [...new Set(ids)].sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * List models exposed by the configured suggest endpoint.
+ *
+ * Some OpenAI-compatible servers do not implement `/models`; the caller can
+ * fall back to manual input when this throws.
+ */
+export async function listSuggestModels(
+  config: SuggestLlmConfig,
+  externalSignal?: AbortSignal,
+): Promise<string[]> {
+  const apiKey = resolveApiKey(config);
+  const url = modelsUrl(config.baseUrl);
+  const timeoutMs = Math.max(5_000, config.timeoutMs ?? 60_000);
+  const timeoutController = new AbortController();
+  const timer = setTimeout(() => timeoutController.abort(), timeoutMs);
+  const signal = externalSignal
+    ? AbortSignal.any([timeoutController.signal, externalSignal])
+    : timeoutController.signal;
+
+  try {
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal,
+      });
+    } catch (error) {
+      if ((error as { name?: string }).name === "AbortError") {
+        if (externalSignal?.aborted) {
+          throw new Error("Listing suggest models cancelled.");
+        }
+        throw new Error(
+          `Listing suggest models timed out after ${Math.round(timeoutMs / 1000)}s.`,
+        );
+      }
+      throw new Error(
+        `Listing suggest models failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
+    const bodyText = await response.text();
+    if (!response.ok) {
+      const snippet = bodyText.replace(/\s+/g, " ").trim().slice(0, 400);
+      throw new Error(
+        `Suggest models HTTP ${response.status}: ${snippet || "(empty response)"}`,
+      );
+    }
+
+    let data: ModelsResponse;
+    try {
+      data = JSON.parse(bodyText) as ModelsResponse;
+    } catch {
+      throw new Error(
+        `Suggest models returned non-JSON: ${bodyText.slice(0, 300)}`,
+      );
+    }
+    if (data.error?.message) {
+      throw new Error(`Suggest models error: ${data.error.message}`);
+    }
+    return parseModelIds(data);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Build the OpenAI-compatible request body. Exported so the optional thinking
+ * fields can be unit-tested without touching the network.
+ *
+ * `thinking` and `reasoningEffort` are forwarded verbatim: the extension does
+ * not know (or translate) each provider's thinking-level mapping.
+ */
+export function buildSuggestionRequestBody(
+  prompt: string,
+  config: SuggestLlmConfig,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    model: config.model,
+    messages: [{ role: "user", content: prompt }],
+    temperature: config.temperature ?? 0.2,
+    max_tokens: config.maxTokens ?? 2_048,
+    stream: false,
+  };
+
+  const thinkingValue = config.thinking;
+  const thinking =
+    typeof thinkingValue === "boolean"
+      ? thinkingValue
+        ? "enabled"
+        : "disabled"
+      : typeof thinkingValue === "string"
+        ? thinkingValue.trim()
+        : "";
+  if (thinking) {
+    body.thinking = { type: thinking };
+  }
+
+  const reasoningEffort =
+    typeof config.reasoningEffort === "string"
+      ? config.reasoningEffort.trim()
+      : "";
+  if (reasoningEffort) {
+    body.reasoning_effort = reasoningEffort;
+  }
+
+  return body;
+}
+
+/**
  * Call the configured OpenAI-compatible endpoint and return the raw content
  * of the first choice. The prompt is logged before the request so failures
  * can be inspected afterwards.
@@ -311,6 +450,7 @@ export async function requestSuggestion(
   prompt: string,
   config: SuggestLlmConfig,
   cwd: string,
+  externalSignal?: AbortSignal,
 ): Promise<string> {
   const apiKey = resolveApiKey(config);
   const url = chatCompletionsUrl(config.baseUrl);
@@ -318,8 +458,11 @@ export async function requestSuggestion(
   logPrompt(prompt, modelLabel, cwd);
 
   const timeoutMs = Math.max(5_000, config.timeoutMs ?? 60_000);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timeoutController = new AbortController();
+  const timer = setTimeout(() => timeoutController.abort(), timeoutMs);
+  const signal = externalSignal
+    ? AbortSignal.any([timeoutController.signal, externalSignal])
+    : timeoutController.signal;
 
   try {
     let response: Response;
@@ -330,17 +473,14 @@ export async function requestSuggestion(
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiKey}`,
         },
-        body: JSON.stringify({
-          model: config.model,
-          messages: [{ role: "user", content: prompt }],
-          temperature: config.temperature ?? 0.2,
-          max_tokens: config.maxTokens ?? 2_048,
-          stream: false,
-        }),
-        signal: controller.signal,
+        body: JSON.stringify(buildSuggestionRequestBody(prompt, config)),
+        signal,
       });
     } catch (error) {
       if ((error as { name?: string }).name === "AbortError") {
+        if (externalSignal?.aborted) {
+          throw new Error("Label suggestion cancelled.");
+        }
         throw new Error(
           `Label suggestion timed out after ${Math.round(timeoutMs / 1000)}s.`,
         );

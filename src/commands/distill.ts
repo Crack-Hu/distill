@@ -35,6 +35,8 @@ import {
   trashDirFor,
   trashSession,
 } from "../engine/session-io";
+import { listSuggestModels } from "../engine/suggest";
+import { handleSuggestLabel } from "./suggest-label";
 
 export { collectOffPathSubtree } from "../engine/turn-group";
 
@@ -52,7 +54,7 @@ const CANCEL = "Cancel";
 
 /** Default config used when no config file exists yet. */
 function defaultConfig(): DistillConfig {
-  return { autoClean: false, summaryModel: "inherit", contextOn: false, drop: false };
+  return { autoClean: false, distill_model: "inherit", contextOn: false, drop: false };
 }
 
 /**
@@ -63,7 +65,19 @@ export function loadConfig(cwd: string): DistillConfig {
   const path = configPathFor(cwd);
   try {
     if (existsSync(path)) {
-      return { ...defaultConfig(), ...JSON.parse(readFileSync(path, "utf8")) };
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<DistillConfig> & {
+        /** Legacy field name kept for migration. */
+        summaryModel?: string;
+      };
+      const merged: DistillConfig = { ...defaultConfig(), ...parsed };
+
+      // Legacy config migration: summaryModel → distill_model. If both are
+      // present, distill_model wins.
+      if (!parsed.distill_model && typeof parsed.summaryModel === "string") {
+        merged.distill_model = parsed.summaryModel;
+      }
+      delete merged.summaryModel;
+      return merged;
     }
   } catch {
     // fall through to defaults
@@ -2117,14 +2131,16 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
     { value: "context off", label: "context off", description: "Disable background context" },
     { value: "auto-clean on", label: "auto-clean on", description: "Delete old session after distill" },
     { value: "auto-clean off", label: "auto-clean off", description: "Keep old sessions (marked [distilled])" },
-    { value: "model", label: "model", description: "Select summary model" },
+    { value: "model", label: "model", description: "Select distill model" },
+    { value: "model_suggest", label: "model_suggest", description: "Select model for suggest_lab" },
+    { value: "suggest_lab", label: "suggest_lab", description: "Suggest a label position with an LLM" },
     { value: "clean", label: "clean", description: "Reclaim this project's distilled sessions to trash" },
     { value: "clean all", label: "clean all", description: "Reclaim distilled sessions from every project" },
   ];
 
   pi.registerCommand("distill", {
     description:
-      "Context distill: /distill <label> [supplement] (tag both ends of a range with the same name); /distill up [supplement] compresses back to the previous summary or the whole branch; /distill del [<label>] deletes a range; /distill merge [<label>] folds sibling branches under a branch summary (auto-detect when no label)",
+      "Context distill: /distill <label> [supplement] (tag both ends of a range with the same name); /distill up [supplement] compresses back to the previous summary or the whole branch; /distill del [<label>] deletes a range; /distill merge [<label>] folds sibling branches under a branch summary (auto-detect when no label); /distill model_suggest selects the suggest_lab model; /distill suggest_lab [hint] suggests a label position with an LLM",
     getArgumentCompletions: (argumentPrefix) => {
       const prefix = argumentPrefix.trim().toLowerCase();
       if (!prefix) return subcommandCompletions;
@@ -2138,6 +2154,18 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
       // ---- sub-commands ---------------------------------------------------
 
       const trimmed = args.trim();
+
+      // /distill suggest_lab [hint] — LLM-assisted label suggestion.
+      const suggestMatch = /^suggest_lab(?:\s+([\s\S]+))?$/i.exec(trimmed);
+      if (suggestMatch) {
+        await handleSuggestLabel(pi, suggestMatch[1]?.trim() ?? "", ctx, {
+          config,
+          runCompactAndRebuild,
+          resolveRange,
+          reportDistillError,
+        });
+        return;
+      }
 
       // /distill context on|off
       if (/^context\s+(on|off)$/i.test(trimmed)) {
@@ -2164,17 +2192,79 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
           `${m.provider}/${m.id}${m.name ? ` (${m.name})` : ""}`,
         );
 
-        const chosen = await ctx.ui.select("Select summary model", labels);
+        const chosen = await ctx.ui.select("Select distill model", labels);
         if (chosen) {
           // Extract provider/modelId from the selected label
           const matched = available.find((m) =>
             chosen.startsWith(`${m.provider}/${m.id}`),
           );
           if (matched) {
-            config.summaryModel = `${matched.provider}/${matched.id}`;
+            config.distill_model = `${matched.provider}/${matched.id}`;
             saveConfig(ctx.cwd, config);
-            ctx.ui.notify(`Summary model: ${config.summaryModel}`, "info");
+            ctx.ui.notify(`Distill model: ${config.distill_model}`, "info");
           }
+        }
+        return;
+      }
+
+      // /distill model_suggest — pick the model used by /distill suggest_lab.
+      // Unlike /distill model (pi registry), this endpoint is a separate
+      // OpenAI-compatible service, so list its own /models when available.
+      if (/^model_suggest$/i.test(trimmed)) {
+        const suggest = config.suggest;
+        if (!suggest?.baseUrl?.trim() || !suggest.model?.trim()) {
+          ctx.ui.notify(
+            "No suggest endpoint configured. Add a \"suggest\" block to " +
+              `${configPathFor(ctx.cwd)} first.`,
+            "warning",
+          );
+          return;
+        }
+
+        const current = suggest.model.trim();
+        if (!ctx.hasUI) {
+          ctx.ui.notify(`Suggest model: ${current}`, "info");
+          return;
+        }
+
+        let models: string[] = [];
+        let listError: unknown;
+        ctx.ui.setStatus("distill-model-suggest", "Loading suggest models…");
+        try {
+          models = await listSuggestModels(suggest);
+        } catch (error) {
+          listError = error;
+        } finally {
+          ctx.ui.setStatus("distill-model-suggest", undefined);
+        }
+
+        let chosen: string | undefined;
+        if (models.length > 0) {
+          const labels = models.map((id) =>
+            id === current ? `${id} (current)` : id,
+          );
+          const picked = await ctx.ui.select("Select suggest model", labels);
+          if (picked) {
+            chosen = models[labels.indexOf(picked)] ?? picked;
+          }
+        } else {
+          if (listError) {
+            const message =
+              listError instanceof Error
+                ? listError.message
+                : String(listError);
+            ctx.ui.notify(
+              `Could not list suggest models: ${message}\nEnter a model name manually.`,
+              "warning",
+            );
+          }
+          chosen = await ctx.ui.input("Suggest model", current);
+        }
+
+        if (chosen?.trim()) {
+          config.suggest = { ...suggest, model: chosen.trim() };
+          saveConfig(ctx.cwd, config);
+          ctx.ui.notify(`Suggest model: ${config.suggest.model}`, "info");
         }
         return;
       }
@@ -2254,7 +2344,8 @@ export function registerDistillCommand(pi: ExtensionAPI): void {
             "  /distill up [supplement]  compress back to the previous summary or the whole branch\n" +
             "  /distill del <label>  deletes the range without summarizing\n" +
             "  /distill merge [<label>]  auto-detect current branch and merge (no label) or merge by label\n" +
-            "Sub-commands: up  /  context on|off  /  auto-clean on|off  /  model  /  clean [all]",
+            "  /distill suggest_lab [hint]  suggest a label position with an LLM\n" +
+            "Sub-commands: up  /  context on|off  /  auto-clean on|off  /  model  /  model_suggest  /  suggest_lab  /  clean [all]",
           "warning",
         );
         return;
