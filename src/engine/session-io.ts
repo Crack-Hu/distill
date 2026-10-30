@@ -9,8 +9,10 @@
  *   - move the file to the project-local trash dir (cwd/.pi/distill/trash)
  *     when the session is replaced in place / auto-cleaned.
  *
- * All runtime artifacts (config, prompt logs, trash) live under
- * `<cwd>/.pi/distill/` so nothing is written next to the extension source.
+ * Logs and trash live under `<cwd>/.pi/distill/`. Config has three layers:
+ * the legacy `<extension>/config.json`, the stable user-level
+ * `<agentDir>/distill/config.json`, and the optional project override
+ * `<cwd>/.pi/distill/config.json`.
  */
 
 import {
@@ -23,6 +25,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+
+const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
 /** How many prompt logs to keep (oldest are pruned on each write). */
 export const LOG_KEEP = 10;
@@ -30,6 +36,11 @@ export const LOG_KEEP = 10;
 /** Project-local runtime directory: `<cwd>/.pi/distill`. */
 export function distillDirFor(cwd: string): string {
   return join(cwd, ".pi", "distill");
+}
+
+/** Extension installation directory (the folder containing index.ts). */
+export function extensionDir(): string {
+  return join(__dirname, "..", "..");
 }
 
 /** Log directory for generated summary prompts. */
@@ -42,9 +53,35 @@ export function trashDirFor(cwd: string): string {
   return join(distillDirFor(cwd), "trash");
 }
 
-/** Config file path for the current project. */
-export function configPathFor(cwd: string): string {
+/** Project-level config override: `<cwd>/.pi/distill/config.json`. */
+export function projectConfigPath(cwd: string): string {
   return join(distillDirFor(cwd), "config.json");
+}
+
+/** Extension-level shared config: `<extension>/config.json`. */
+export function extensionConfigPath(): string {
+  return join(extensionDir(), "config.json");
+}
+
+/**
+ * Stable user-level config: `<agentDir>/distill/config.json`.
+ *
+ * `getAgentDir()` honors `PI_CODING_AGENT_DIR` (default `~/.pi/agent`), so
+ * this location survives extension updates/reinstalls — unlike a config file
+ * stored inside the package checkout.
+ */
+export function globalConfigPath(): string {
+  return join(getAgentDir(), "distill", "config.json");
+}
+
+/**
+ * The config file settings commands write to: the project override when it
+ * exists, otherwise the stable user-level global config.
+ */
+export function configPathFor(cwd: string): string {
+  return existsSync(projectConfigPath(cwd))
+    ? projectConfigPath(cwd)
+    : globalConfigPath();
 }
 
 function ensureDir(dir: string): void {

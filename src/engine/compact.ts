@@ -7,12 +7,6 @@
 import { uuidv7 } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import type {
-  Component,
-  KeybindingsManager,
-  Theme,
-  TUI,
-} from "@earendil-works/pi-tui";
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -27,6 +21,7 @@ import {
 import type { AnyEntry, Turn } from "./turn-group";
 import { buildSummaryPrompt, formatMessages } from "./prompt";
 import { LOG_KEEP, logDirFor } from "./session-io";
+import { ProgressDialog } from "../ui/progress";
 
 // ---- prompt logging -------------------------------------------------------
 
@@ -79,8 +74,8 @@ export interface CompactRange {
 }
 
 /**
- * OpenAI-compatible LLM endpoint used by /suggest-label. Kept separate from
- * `summaryModel` (which resolves through pi's model registry) so label
+ * OpenAI-compatible LLM endpoint used by /distill suggest_lab. Kept separate
+ * from `distill_model` (which resolves through pi's model registry) so label
  * suggestion can target a cheap model with its own key.
  */
 export interface SuggestLlmConfig {
@@ -96,15 +91,34 @@ export interface SuggestLlmConfig {
   timeoutMs?: number;
   /** Per-message character cap for the compact transcript sent to the LLM. */
   maxCharsPerMessage?: number;
+  /**
+   * Provider-specific thinking switch. Sent as `thinking: { type }` when set.
+   * Values are passed through unchanged (e.g. "enabled" / "disabled"); they
+   * are not mapped to any provider's internal thinking levels. Booleans are
+   * accepted as a convenience (true → "enabled", false → "disabled").
+   */
+  thinking?: "enabled" | "disabled" | boolean;
+  /**
+   * Sent as `reasoning_effort` when set. Values are provider/model specific
+   * (e.g. "low" / "high" / "max") and are passed through unchanged — the
+   * extension deliberately does not translate them.
+   */
+  reasoningEffort?: string;
 }
 
 export interface DistillConfig {
   autoClean: boolean;
-  summaryModel: string;
+  /**
+   * Model used for summary generation: "inherit" (reuse the current agent
+   * model) or "provider/model" resolved through pi's model registry.
+   */
+  distill_model: string;
+  /** @deprecated Legacy alias for distill_model; migrated on load. */
+  summaryModel?: string;
   contextOn: boolean;
   /** Skip summary generation and simply drop the compressed range. */
   drop: boolean;
-  /** LLM endpoint for /suggest-label (optional; the command errors without it). */
+  /** LLM endpoint for /distill suggest_lab (optional; the command errors without it). */
   suggest?: SuggestLlmConfig;
 }
 
@@ -235,118 +249,6 @@ export class SummaryCancelledError extends Error {
   }
 }
 
-// Braille dots: eastAsianWidth() says 1 column, but some terminals/fonts
-// render them 2 columns wide. Count them conservatively as 2 so the box
-// border never overflows and wraps — a 1-column render just leaves one
-// extra space before the right border.
-const SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
-
-/**
- * Visible width of a (possibly styled) string. Braille dot characters are
- * counted as 2 columns to stay safe across terminals (see SPINNER_FRAMES).
- */
-function visibleWidth(s: string): number {
-  const plain = s.replace(/\x1b\[[0-9;]*m/g, "");
-  let w = 0;
-  for (const ch of plain) {
-    const cp = ch.codePointAt(0) ?? 0;
-    w += cp >= 0x2800 && cp <= 0x28ff ? 2 : 1;
-  }
-  return w;
-}
-
-/**
- * Formal progress dialog shown while the summary is being generated: a top
- * rule with the title, a spinner line, the model in use (dimmed), and a
- * footer hint for the cancel key. No left/right borders — instead every row
- * is padded to the full box width and filled with the panel background, so
- * the layer below is fully covered regardless of row content. Escape
- * (tui.select.cancel, honoring user keybinding config) aborts the
- * generation; a settled generation closes the dialog with "done" (success
- * or failure — the caller re-awaits to see errors).
- */
-class DistillProgressDialog implements Component {
-  private static readonly BOX_W = 52;
-  private settled = false;
-  private frame = 0;
-  private ticker: ReturnType<typeof setInterval> | undefined;
-  private readonly finish: (result: "done" | "cancel") => void;
-
-  constructor(
-    private readonly tui: TUI,
-    private readonly theme: Theme,
-    private readonly keybindings: KeybindingsManager,
-    generation: Promise<unknown>,
-    private readonly modelLabel: string,
-    done: (result: "done" | "cancel") => void,
-  ) {
-    this.finish = (result) => {
-      if (this.settled) return;
-      this.settled = true;
-      if (this.ticker) clearInterval(this.ticker);
-      done(result);
-    };
-    // Close the dialog when the generation settles, success or failure.
-    void generation.then(
-      () => this.finish("done"),
-      () => this.finish("done"),
-    );
-    this.ticker = setInterval(() => {
-      this.frame++;
-      this.tui.requestRender();
-    }, 100);
-  }
-
-  handleInput(data: string): void {
-    // Match the same cancel key pi's select dialogs use (Esc by default).
-    if (this.keybindings.matches(data, "tui.select.cancel")) {
-      this.finish("cancel");
-    }
-  }
-
-  render(width: number): string[] {
-    const W = Math.min(width, DistillProgressDialog.BOX_W);
-    const { theme } = this;
-    const border = (s: string) => theme.fg("border", s);
-    const dim = (s: string) => theme.fg("dim", s);
-    const accent = (s: string) => theme.fg("accent", s);
-    // Panel row: right-pad the (possibly styled) line to the full box width,
-    // then fill the whole row with the panel background so the layer below
-    // never shows through between rows (no side borders to do that job).
-    const panel = (styled: string) =>
-      theme.bg(
-        "selectedBg",
-        styled + " ".repeat(Math.max(0, W - visibleWidth(styled))),
-      );
-
-    const title = " Compacting context ";
-    const top = border(
-      `┌─${title}${`─`.repeat(Math.max(0, W - visibleWidth(title) - 4))}─┐`,
-    );
-    const bottom = border(`└${`─`.repeat(W - 2)}┘`);
-    const spin = SPINNER_FRAMES[this.frame % SPINNER_FRAMES.length];
-    const key = this.keybindings.getKeys("tui.select.cancel")?.[0] ?? "esc";
-    const indent = "  ";
-
-    return [
-      panel(top),
-      panel(""),
-      panel(indent + accent(spin) + ` Generating summary…`),
-      panel(""),
-      panel(indent + dim(`Model: ${this.modelLabel}`)),
-      panel(""),
-      panel(indent + dim(`${key} to cancel`)),
-      panel(bottom),
-    ];
-  }
-
-  invalidate(): void {}
-
-  dispose(): void {
-    if (this.ticker) clearInterval(this.ticker);
-  }
-}
-
 /**
  * Run summary generation behind a cancellable overlay. Returns the summary,
  * or throws SummaryCancelledError when the user aborts with Esc. Without a
@@ -384,12 +286,16 @@ async function generateSummaryWithCancel(
   }`;
   const outcome = await ctx.ui.custom<"done" | "cancel">(
     (tui, theme, keybindings, done) =>
-      new DistillProgressDialog(
+      new ProgressDialog(
         tui,
         theme,
         keybindings,
         generation,
-        modelLabel,
+        {
+          title: "Compacting context",
+          message: "Generating summary…",
+          modelLabel,
+        },
         done,
       ),
     {
@@ -399,7 +305,7 @@ async function generateSummaryWithCancel(
       // can never see the Esc press.
       onHandle: (handle) => handle.focus(),
       overlayOptions: {
-        width: DistillProgressDialog.BOX_W,
+        width: ProgressDialog.BOX_W,
       },
     },
   );
@@ -869,17 +775,17 @@ export async function executeCompact(
 
   // Determine model for summary
   let model;
-  if (config.summaryModel === "inherit") {
+  if (config.distill_model === "inherit") {
     model = ctx.model;
     if (!model) throw new Error("Current conversation model not found.");
   } else {
     // Parse "provider/modelId" format
-    const [provider, ...modelParts] = config.summaryModel.split("/");
+    const [provider, ...modelParts] = config.distill_model.split("/");
     const modelId = modelParts.join("/");
     model = ctx.modelRegistry.find(provider, modelId);
     if (!model) {
       throw new Error(
-        `Summary model "${config.summaryModel}" not found. Use /distill model to select.`,
+        `Distill model "${config.distill_model}" not found. Use /distill model to select.`,
       );
     }
   }

@@ -1,6 +1,6 @@
 /**
  * Unit tests for the compact transcript builder, prompt renderer, label
- * numbering, and suggestion parser used by /suggest-label.
+ * numbering, and suggestion parser used by /distill suggest_lab.
  *
  * Run:  bun test tests/suggest.test.ts
  */
@@ -12,8 +12,11 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   buildSuggestPrompt,
   buildSuggestTranscript,
+  buildSuggestionRequestBody,
   formatSuggestTranscript,
+  modelsUrl,
   nextSuggestLabelName,
+  parseModelIds,
   parseSuggestion,
 } from "../src/engine/suggest";
 
@@ -295,4 +298,100 @@ test("does not reject a target that already has a label", () => {
   );
   assert.equal(parsed.kind, "label");
   if (parsed.kind === "label") assert.equal(parsed.entryId, u1);
+});
+
+test("request body forwards thinking fields verbatim and omits unset ones", () => {
+  const base = { baseUrl: "https://api.deepseek.com", model: "deepseek-flash" };
+
+  const plain = buildSuggestionRequestBody("prompt", base);
+  assert.equal("thinking" in plain, false);
+  assert.equal("reasoning_effort" in plain, false);
+  assert.equal(plain.max_tokens, 2048);
+  assert.equal(plain.temperature, 0.2);
+
+  const disabled = buildSuggestionRequestBody("prompt", {
+    ...base,
+    thinking: "disabled",
+  });
+  assert.deepEqual(disabled.thinking, { type: "disabled" });
+  assert.equal("reasoning_effort" in disabled, false);
+
+  const boolDisabled = buildSuggestionRequestBody("prompt", {
+    ...base,
+    thinking: false,
+  });
+  assert.deepEqual(boolDisabled.thinking, { type: "disabled" });
+
+  const boolEnabled = buildSuggestionRequestBody("prompt", {
+    ...base,
+    thinking: true,
+  });
+  assert.deepEqual(boolEnabled.thinking, { type: "enabled" });
+
+  const low = buildSuggestionRequestBody("prompt", {
+    ...base,
+    reasoningEffort: "low",
+  });
+  assert.equal(low.reasoning_effort, "low");
+  assert.equal("thinking" in low, false);
+
+  const both = buildSuggestionRequestBody("prompt", {
+    ...base,
+    thinking: "disabled",
+    reasoningEffort: "max",
+  });
+  assert.deepEqual(both.thinking, { type: "disabled" });
+  assert.equal(both.reasoning_effort, "max");
+});
+
+test("request body treats blank thinking fields as unset", () => {
+  const body = buildSuggestionRequestBody("prompt", {
+    baseUrl: "https://api.deepseek.com",
+    model: "deepseek-flash",
+    thinking: "  " as any,
+    reasoningEffort: "  ",
+  });
+  assert.equal("thinking" in body, false);
+  assert.equal("reasoning_effort" in body, false);
+});
+
+test("modelsUrl handles base URLs and full completions URLs", () => {
+  assert.equal(
+    modelsUrl("https://api.deepseek.com"),
+    "https://api.deepseek.com/models",
+  );
+  assert.equal(
+    modelsUrl("https://api.deepseek.com/"),
+    "https://api.deepseek.com/models",
+  );
+  assert.equal(
+    modelsUrl("https://api.deepseek.com/v1"),
+    "https://api.deepseek.com/v1/models",
+  );
+  assert.equal(
+    modelsUrl("https://api.deepseek.com/chat/completions"),
+    "https://api.deepseek.com/models",
+  );
+  assert.equal(
+    modelsUrl("https://api.deepseek.com/v1/chat/completions/"),
+    "https://api.deepseek.com/v1/models",
+  );
+});
+
+test("parseModelIds dedupes, sorts, and ignores invalid entries", () => {
+  assert.deepEqual(
+    parseModelIds({
+      data: [
+        { id: "deepseek-v4-pro" },
+        { id: "deepseek-flash" },
+        { id: "deepseek-flash" },
+        { id: 42 },
+        {},
+        null,
+      ],
+    }),
+    ["deepseek-flash", "deepseek-v4-pro"],
+  );
+  assert.deepEqual(parseModelIds({}), []);
+  assert.deepEqual(parseModelIds(null), []);
 });

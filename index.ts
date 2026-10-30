@@ -11,15 +11,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { registerDistillCommand, registerSessionGuards } from "./src/commands/distill";
-import { registerSuggestLabelCommand } from "./src/commands/suggest-label";
 import { registerViewDistilledTool } from "./src/tools/view-distilled";
 
 export default function (pi: ExtensionAPI) {
-  // Register the /distill command
+  // Register the /distill command (including /distill suggest_lab)
   registerDistillCommand(pi);
-
-  // Register the LLM-assisted label suggestion command
-  registerSuggestLabelCommand(pi);
 
   // Guard distilled sessions (read-only, fork on first message)
   registerSessionGuards(pi);

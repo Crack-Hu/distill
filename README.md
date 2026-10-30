@@ -21,7 +21,9 @@ pi install https://github.com/Crack-Hu/distill
 ```
 
 > 扩展零依赖，安装后即可使用，无需 `npm install`。
-> 本地开发可用 `pi -e ./distill/index.ts` 直接加载。
+> 安装目录会带有 `config.json.example`；推荐复制到 `~/.pi/agent/distill/config.json`（稳定全局配置，扩展更新/重装不会丢），也可以放到 `<cwd>/.pi/distill/config.json` 只覆盖当前项目。
+> 不配置也能使用 `/distill`（默认复用当前会话模型）。
+> 本地开发可用 `pi -e ./index.ts` 直接加载。
 
 ---
 
@@ -54,19 +56,20 @@ pi install https://github.com/Crack-Hu/distill
 | `/distill merge [<label>]` | 无标签时自动检测当前分支，压缩并合并到分岔点；有标签时收拢指定分支摘要或标签指向的分支 |
 | `/distill context on\|off` | 摘要生成时是否携带完整上文背景 |
 | `/distill auto-clean on\|off` | 压缩后是否自动删除旧会话（默认 off） |
-| `/distill model` | 选择摘要生成模型（从 pi 已注册模型） |
+| `/distill model` | 选择 distill 摘要模型（从 pi 已注册模型） |
+| `/distill model_suggest` | 选择 `suggest_lab` 的模型（从 `suggest.baseUrl` 的 `/models` 列表；失败时可手动输入） |
 | `/distill clean [all]` | 回收当前项目的 `[distilled]` 旧会话到 trash；加 `all` 回收所有项目 |
 | `/distill fork <path> [message]` | 从蒸馏会话 fork 出新会话继续工作 |
-| `/suggest-label [提示]` | 让 LLM 根据任务逻辑建议一个标签位置 |
+| `/distill suggest_lab [提示]` | 让 LLM 根据任务逻辑建议一个标签位置 |
 
 ---
 
-## AI 标签建议（/suggest-label）
+## AI 标签建议（/distill suggest_lab）
 
-手动在 `/tree` 里逐个 `shift+L` 打标比较繁琐。`/suggest-label` 会让 LLM 阅读当前分支，按**工作任务逻辑**建议一个标签位置：
+手动在 `/tree` 里逐个 `shift+L` 打标比较繁琐。`/distill suggest_lab` 会让 LLM 阅读当前分支，按**工作任务逻辑**建议一个标签位置：
 
 ```
-/suggest-label [可选提示，例如：重点标出调试阶段]
+/distill suggest_lab [可选提示，例如：重点标出调试阶段]
 ```
 
 发送给 LLM 的不是完整对话，而是一份精简记录，以控制 token：
@@ -77,6 +80,8 @@ pi install https://github.com/Crack-Hu/distill
 - 只分析**当前分支**：从当前 leaf 沿 `parentId` 回溯到根节点，旁支不参与
 
 LLM 只返回目标 turn 和 2-4 句说明；标签名由扩展自动生成 `suggest-1`、`suggest-2`…（扫描会话中已有的 `suggest-N` 后取下一个编号）。
+
+模型可以用 `/distill model_suggest` 选择：它会请求 `suggest.baseUrl` 的 `/models` 列表并写回 `suggest.model`；如果端点不支持 `/models`，会提示手动输入。
 
 前端会展示位置和理由，并给出三个选项：
 
@@ -90,7 +95,7 @@ LLM 只返回目标 turn 和 2-4 句说明；标签名由扩展自动生成 `sug
 
 ### 配置
 
-该命令使用独立的 OpenAI 兼容端点，不经过 pi 的模型注册表。在项目配置 `<cwd>/.pi/distill/config.json` 中加入：
+该命令使用独立的 OpenAI 兼容端点，不经过 pi 的模型注册表。在稳定全局配置 `<agentDir>/distill/config.json`（默认 `~/.pi/agent/distill/config.json`）或项目覆盖 `<cwd>/.pi/distill/config.json` 中加入：
 
 ```json
 {
@@ -100,6 +105,8 @@ LLM 只返回目标 turn 和 2-4 句说明；标签名由扩展自动生成 `sug
     "apiKeyEnv": "DEEPSEEK_API_KEY_PI",
     "temperature": 0.2,
     "maxTokens": 2048,
+    "thinking": "disabled",
+    "reasoningEffort": "low",
     "timeoutMs": 60000,
     "maxCharsPerMessage": 800
   }
@@ -109,17 +116,28 @@ LLM 只返回目标 turn 和 2-4 句说明；标签名由扩展自动生成 `sug
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `baseUrl` | （必填） | OpenAI 兼容端点；代码会拼接 `/chat/completions` |
-| `model` | （必填） | 模型名 |
+| `model` | （必填） | 模型名；可用 `/distill model_suggest` 从端点 `/models` 选择 |
 | `apiKeyEnv` | — | 存放 API key 的环境变量名（推荐） |
 | `apiKey` | — | 直接写 key（不推荐提交） |
 | `temperature` | `0.2` | 采样温度 |
-| `maxTokens` | `2048` | 最大输出 token；推理模型需要留足余量 |
+| `maxTokens` | `2048` | 最大输出 token（含 reasoning tokens）；关闭 thinking 后 `1024` 通常足够 |
+| `thinking` | — | 透传为 `thinking: { type: ... }`；常用 `"enabled"` / `"disabled"`（也接受 `true` / `false`），不填则用服务端默认值 |
+| `reasoningEffort` | — | 透传为 `reasoning_effort`；取值由模型/供应商决定（如 `low`/`high`/`max`），扩展不做等级映射 |
 | `timeoutMs` | `60000` | 请求超时 |
 | `maxCharsPerMessage` | `800` | 单条消息截断长度 |
 
-仓库根目录的 `config.json.example` 是完整模板。建议把它复制到 `<cwd>/.pi/distill/config.json`，并把 `apiKeyEnv` 指向你环境中的变量（例如 `DEEPSEEK_API_KEY_PI`）。
+`thinking` 和 `reasoningEffort` 都是可选字段，也都原样转发；扩展不负责把 `low` 映射成某个模型的具体思考等级。示例同时列出它们只是为了展示，按需保留即可（DeepSeek 在 `thinking: "disabled"` 时会忽略 `reasoning_effort`）。对于打标这种简单提取任务，推荐 `"thinking": "disabled"`：DeepSeek 等推理模型默认会在隐藏 reasoning 上消耗大量输出 token，可能把 `maxTokens` 用尽并返回空 content。若模型不支持关闭 thinking，可删掉该字段，改用 `reasoningEffort`。
 
-> 与 `summaryModel` 的区别：`summaryModel` 走 pi 已注册模型；`suggest` 是独立的 OpenAI 兼容配置，便于给打标任务使用更便宜/更快的模型。
+扩展安装目录里的 `config.json.example` 是完整模板。推荐复制到用户级配置目录（**不要**放在扩展安装目录，更新/重装会重置那里）：
+
+```bash
+mkdir -p ~/.pi/agent/distill
+cp <扩展安装目录>/config.json.example ~/.pi/agent/distill/config.json
+```
+
+如果设置了 `PI_CODING_AGENT_DIR`，把 `~/.pi/agent` 换成它。如果只想对某个项目使用不同的端点/模型，再复制到 `<cwd>/.pi/distill/config.json` 覆盖。把 `apiKeyEnv` 指向你环境中的变量（例如 `DEEPSEEK_API_KEY_PI`）。
+
+> 与 `distill_model` 的区别：`distill_model` 走 pi 已注册模型；`suggest` 是独立的 OpenAI 兼容配置，便于给打标任务使用更便宜/更快的模型。
 
 ---
 
@@ -262,12 +280,34 @@ Step 2  Session method
 
 ## 配置
 
-`config.json` 位于当前工作目录的 `<cwd>/.pi/distill/config.json`（每个项目独立，首次运行自动创建；旧版本扩展目录下的 `config.json` 会自动迁移）：
+配置是**可选**的，按三层查找：
+
+1. `<agentDir>/distill/config.json` — 稳定用户级全局配置（推荐）。默认 `~/.pi/agent/distill/config.json`，受 `PI_CODING_AGENT_DIR` 影响
+2. `<cwd>/.pi/distill/config.json` — 项目覆盖（可选）
+3. `<扩展安装目录>/config.json` — 旧版兼容 fallback（仍会读取，但扩展更新/重装可能删除未跟踪文件，不建议作为长期位置）
+
+优先级：**项目配置 > 用户级全局配置 > 扩展目录配置 > 内置默认值**。各层的 `suggest` 块会**深合并**，所以高优先级配置可以只覆盖其中一个字段。
+
+三层都不存在时使用默认值（`distill_model: "inherit"`，即复用当前会话模型），所以零配置也能正常使用 `/distill`。首次运行**不会自动创建**文件；执行 `/distill model`、`/distill context on|off` 或 `/distill auto-clean on|off` 保存设置时：
+
+- 项目配置已存在 → 写入项目配置
+- 否则 → 写入用户级全局配置 `<agentDir>/distill/config.json`（不存在则创建目录和文件）
+
+`/distill model_suggest` 需要已有 `suggest` 配置（任一层），不会单独创建配置文件。
+
+扩展安装目录（`index.ts` 所在目录）里的 `config.json.example` 是模板。推荐复制到用户级配置目录：
+
+```bash
+mkdir -p ~/.pi/agent/distill
+cp <扩展安装目录>/config.json.example ~/.pi/agent/distill/config.json
+```
+
+如果只想覆盖某个项目，再复制到 `<cwd>/.pi/distill/config.json`。
 
 ```json
 {
   "autoClean": false,
-  "summaryModel": "inherit",
+  "distill_model": "inherit",
   "contextOn": false
 }
 ```
@@ -275,21 +315,32 @@ Step 2  Session method
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
 | `autoClean` | `false` | 压缩后自动把旧会话移入 trash（否则标记 `[distilled]` 保留） |
-| `summaryModel` | `"inherit"` | 摘要生成模型；`"inherit"` = 使用当前对话模型 |
+| `distill_model` | `"inherit"` | 摘要生成模型；`"inherit"` = 复用当前会话模型。更推荐显式填写 `provider/model`（可预测、可控） |
 | `contextOn` | `false` | 摘要生成时是否携带完整上文背景（否则只取最后 2 条） |
+
+`distill_model` 支持两种值：
+
+- `"inherit"`：复用当前会话的 agent 模型，配置最省事。
+- `"provider/model"`（如 `"deepseek/deepseek-flash"`）：走 pi 已注册模型，**推荐**。agent 的模型通常按交互编码场景调过思考等级/上下文参数，直接继承不一定适合摘要生成；显式指定一个专用模型更可控、更可预测。
+
+兼容旧配置：旧版的 `summaryModel` 在任一层读取时都会按 `distill_model` 处理；下次保存配置时才会写成 `distill_model`。同一层里如果两者同时存在，以 `distill_model` 为准。
+
+旧版放在**扩展安装目录**里的 `config.json` 仍会被读取（作为最低优先级的 fallback），但该目录可能被更新重置；请把长期配置放在 `~/.pi/agent/distill/config.json`。
 
 > 注：`contextOn` 也可以在 `/tree` 中通过 `/distill context on|off` 切换，`autoClean` 同理。
 
 ---
 
-## 运行时文件（<cwd>/.pi/distill/）
+## 运行时文件与配置
 
-所有运行时产物都写在当前工作目录的 `.pi/distill/` 下，不会污染扩展源码目录：
+项目级运行时产物写在当前工作目录的 `.pi/distill/` 下；全局配置位于 pi 的 agent 目录：
 
 | 路径 | 内容 |
 |------|------|
-| `config.json` | 项目配置（见上） |
-| `logs/` | 每次摘要生成的完整 prompt（明文，自动只保留最近 10 个） |
+| `<agentDir>/distill/config.json` | 用户级全局配置（推荐；含 `suggest` 时所有项目共用） |
+| `<扩展安装目录>/config.json` | 旧版兼容 fallback（仍会读取；扩展更新可能删除） |
+| `<cwd>/.pi/distill/config.json` | 项目级配置（可选；存在时覆盖全局配置） |
+| `logs/` | 摘要与 suggest_lab 生成的完整 prompt（`distill-*` 和 `suggest-*` 各保留最近 10 个） |
 | `trash/` | 被替换/回收的旧会话文件（扩展不提供清空命令；确认无误后可手动删除该目录下文件） |
 
 ### 安全删除策略
@@ -302,7 +353,7 @@ Step 2  Session method
 
 ## 摘要 prompt
 
-摘要模板外部化为 `distill-summary-prompt.md`（中文，保证摘要输出中文）。当使用 `/distill <label> [补充]` 传入补充说明时，会额外加载 `distill-summary-prompt-append.md` 模板，将其中的 `{{SUPPLEMENT}}` 占位符替换为用户补充的内容，并拼接在最终 prompt 末尾。两个模板都可直接编辑，代码只负责替换占位符与拼接。`<cwd>/.pi/distill/logs/` 会记录每次生成的 prompt（只保留最近 10 个），便于调试。
+摘要模板外部化为 `distill-summary-prompt.md`（中文，保证摘要输出中文）。当使用 `/distill <label> [补充]` 传入补充说明时，会额外加载 `distill-summary-prompt-append.md` 模板，将其中的 `{{SUPPLEMENT}}` 占位符替换为用户补充的内容，并拼接在最终 prompt 末尾。两个模板都可直接编辑，代码只负责替换占位符与拼接。`<cwd>/.pi/distill/logs/` 会记录每次生成的 prompt（`distill-*` 与 `suggest-*` 各保留最近 10 个），便于调试。
 
 `formatMessages` 将对话结构化为 JSON 数组（role: `user` / `assistant` / `tool_result` / `distilled_summary`）交给摘要模型，避免模型臆造对话归属。
 
@@ -311,6 +362,6 @@ Step 2  Session method
 ## 已知限制 / 取舍
 
 - **压缩范围含分支点**：压缩后分支无法随新会话带走（它仍留在旧 `[distilled]` 会话里），因此这类范围仅允许"新建会话"；需要在分支点前后分别压缩时请手动打标签
-- **标签名与子命令同名**：`del`、`up`、`merge`、`clean`、`model`、`fork`、`context`、`auto-clean` 会被 `/distill` 解析成子命令，因此这些标签无法通过 `/distill <label>` 触发压缩（语法歧义的取舍；`/suggest-label` 会自动给这类名字加后缀）
+- **标签名与子命令同名**：`del`、`up`、`merge`、`clean`、`model`、`model_suggest`、`fork`、`context`、`auto-clean`、`suggest_lab` 会被 `/distill` 解析成子命令，因此这些标签无法通过 `/distill <label>` 触发压缩（语法歧义的取舍）。`/distill suggest_lab` 生成的标签名固定为 `suggest-N`，不会与这些子命令冲突。
 - **append-only 模型**：旧会话文件不物理删除，而是保留标记或移入 `<cwd>/.pi/distill/trash/`（`/distill clean [all]` 只负责回收，清空需手动删除 trash 文件）
 - **单删第一轮**：树根所在的第一轮不允许单独删除（无前置内容可衔接）

@@ -1,6 +1,6 @@
 {
   "autoClean": false,
-  "summaryModel": "inherit",
+  "distill_model": "inherit",
   "contextOn": false,
   "suggest": {
     "baseUrl": "https://api.deepseek.com",
@@ -8,6 +8,8 @@
     "apiKeyEnv": "DEEPSEEK_API_KEY_PI",
     "temperature": 0.2,
     "maxTokens": 2048,
+    "thinking": "disabled",
+    "reasoningEffort": "low",
     "timeoutMs": 60000,
     "maxCharsPerMessage": 800
   }
