@@ -23,12 +23,14 @@ import {
 } from "../engine/session-io";
 import { ProgressDialog } from "../ui/progress";
 import {
+  buildExpansionPrompt,
   buildSuggestPrompt,
   buildSuggestTranscript,
   nextSuggestLabelName,
   parseSuggestion,
   requestSuggestion,
   type LabelSuggestion,
+  type SuggestionMessage,
 } from "../engine/suggest";
 import type {
   DistillConfig,
@@ -40,6 +42,7 @@ const CONFIG_TEMPLATE_PATH = join(extensionDir(), "config.json.example");
 const CHOICES = {
   ACCEPT: "Accept",
   ACCEPT_DISTILL: "Accept and distill",
+  MOVE_EARLIER: "Move start label earlier",
   REJECT: "Reject",
 } as const;
 
@@ -89,12 +92,18 @@ function applyLabel(
  * summary generation. Returns undefined when the user presses Esc.
  */
 async function requestSuggestionWithCancel(
-  prompt: string,
+  promptOrMessages: string | SuggestionMessage[],
   config: SuggestLlmConfig,
   ctx: ExtensionCommandContext,
+  progressMessage = "Analyzing the conversation…",
 ): Promise<string | undefined> {
   const controller = new AbortController();
-  const generation = requestSuggestion(prompt, config, ctx.cwd, controller.signal);
+  const generation = requestSuggestion(
+    promptOrMessages,
+    config,
+    ctx.cwd,
+    controller.signal,
+  );
 
   if (!ctx.hasUI) return generation;
 
@@ -107,7 +116,7 @@ async function requestSuggestionWithCancel(
         generation,
         {
           title: "Suggesting a label",
-          message: "Analyzing the conversation…",
+          message: progressMessage,
           modelLabel: config.model,
         },
         done,
@@ -143,7 +152,7 @@ function suggestionTitle(
     "",
     suggestion.description,
     "",
-    "Add this label?",
+    "Choose an action:",
   ].join("\n");
 }
 
@@ -183,45 +192,131 @@ export async function handleSuggestLabel(
   }
 
   const hint = args.trim() || undefined;
-  const prompt = buildSuggestPrompt(transcript, hint);
-  const label = nextSuggestLabelName(transcript.existingLabels);
+  const initialPrompt = buildSuggestPrompt(transcript, hint);
+  let messages: SuggestionMessage[] = [
+    { role: "user", content: initialPrompt },
+  ];
 
-  let suggestion: LabelSuggestion;
+  let current: {
+    suggestion: Extract<LabelSuggestion, { kind: "label" }>;
+    raw: string;
+  };
   try {
-    const raw = await requestSuggestionWithCancel(prompt, suggestConfig, ctx);
+    const raw = await requestSuggestionWithCancel(messages, suggestConfig, ctx);
     if (raw === undefined) {
       ctx.ui.notify("Label suggestion cancelled.", "warning");
       return;
     }
-    suggestion = parseSuggestion(raw, transcript.turns);
+    const parsed = parseSuggestion(raw, transcript.turns);
+    if (parsed.kind === "none") {
+      ctx.ui.notify(`No label suggested: ${parsed.reason}`, "info");
+      return;
+    }
+    current = { suggestion: parsed, raw };
   } catch (error) {
     ctx.ui.notify(errorMessage(error), "error");
     return;
   }
 
-  if (suggestion.kind === "none") {
-    ctx.ui.notify(`No label suggested: ${suggestion.reason}`, "info");
-    return;
-  }
+  const label = nextSuggestLabelName(transcript.existingLabels);
 
   if (!ctx.hasUI) {
     ctx.ui.notify(
-      `Suggested label ${label} at turn ${suggestion.turn}: ${suggestion.description}`,
+      `Suggested label ${label} at turn ${current.suggestion.turn}: ${current.suggestion.description}`,
       "info",
     );
     return;
   }
 
-  const choice = await ctx.ui.select(suggestionTitle(suggestion, label), [
-    CHOICES.ACCEPT,
-    CHOICES.ACCEPT_DISTILL,
-    CHOICES.REJECT,
-  ]);
+  let choice: string | undefined;
+  for (;;) {
+    const canExpand = current.suggestion.turn > 1;
+    const options = canExpand
+      ? [
+          CHOICES.ACCEPT,
+          CHOICES.ACCEPT_DISTILL,
+          CHOICES.MOVE_EARLIER,
+          CHOICES.REJECT,
+        ]
+      : [CHOICES.ACCEPT, CHOICES.ACCEPT_DISTILL, CHOICES.REJECT];
+
+    choice = await ctx.ui.select(
+      suggestionTitle(current.suggestion, label),
+      options,
+    );
+    if (choice !== CHOICES.MOVE_EARLIER) break;
+
+    if (!canExpand) {
+      ctx.ui.notify("There is no earlier turn to include.", "warning");
+      continue;
+    }
+
+    const expandMessages: SuggestionMessage[] = [
+      ...messages,
+      { role: "assistant", content: current.raw },
+      {
+        role: "user",
+        content: buildExpansionPrompt(current.suggestion.turn),
+      },
+    ];
+
+    let nextRaw: string | undefined;
+    try {
+      nextRaw = await requestSuggestionWithCancel(
+        expandMessages,
+        suggestConfig,
+        ctx,
+        "Looking further back…",
+      );
+    } catch (error) {
+      ctx.ui.notify(errorMessage(error), "error");
+      continue;
+    }
+    if (nextRaw === undefined) {
+      ctx.ui.notify("Label suggestion cancelled.", "warning");
+      return;
+    }
+
+    let parsed: LabelSuggestion;
+    try {
+      parsed = parseSuggestion(nextRaw, transcript.turns);
+    } catch (error) {
+      ctx.ui.notify(errorMessage(error), "error");
+      continue;
+    }
+    if (parsed.kind === "none") {
+      ctx.ui.notify(`No earlier label suggested: ${parsed.reason}`, "info");
+      continue;
+    }
+
+    const target = transcript.turns[parsed.turn - 1];
+    if (parsed.turn >= current.suggestion.turn) {
+      ctx.ui.notify(
+        "The model did not choose an earlier turn; keeping the current suggestion.",
+        "warning",
+      );
+      continue;
+    }
+    if (target.kind !== "user") {
+      ctx.ui.notify(
+        "The model chose a summary placeholder; keeping the current suggestion.",
+        "warning",
+      );
+      continue;
+    }
+
+    // Commit the successful expansion so the next request can reuse the
+    // entire conversation as a prefix-cacheable message history.
+    messages = expandMessages;
+    current = { suggestion: parsed, raw: nextRaw };
+  }
 
   if (choice !== CHOICES.ACCEPT && choice !== CHOICES.ACCEPT_DISTILL) {
     ctx.ui.notify("Label suggestion rejected.", "info");
     return;
   }
+
+  const suggestion = current.suggestion;
 
   // The model never sees existing labels; warn only after the user has
   // chosen to apply this suggestion.

@@ -398,20 +398,36 @@ export async function listSuggestModels(
   }
 }
 
+/** One message in the suggestion conversation (for prefix-cache reuse). */
+export interface SuggestionMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
 /**
  * Build the OpenAI-compatible request body. Exported so the optional thinking
  * fields can be unit-tested without touching the network.
+ *
+ * `promptOrMessages` may be a single user prompt or a full conversation. The
+ * conversation form is used when the user expands the suggested range: the
+ * initial prompt and the previous assistant reply stay byte-identical, so
+ * providers with automatic prefix caching can reuse them.
  *
  * `thinking` and `reasoningEffort` are forwarded verbatim: the extension does
  * not know (or translate) each provider's thinking-level mapping.
  */
 export function buildSuggestionRequestBody(
-  prompt: string,
+  promptOrMessages: string | SuggestionMessage[],
   config: SuggestLlmConfig,
 ): Record<string, unknown> {
+  const messages =
+    typeof promptOrMessages === "string"
+      ? [{ role: "user" as const, content: promptOrMessages }]
+      : promptOrMessages;
+
   const body: Record<string, unknown> = {
     model: config.model,
-    messages: [{ role: "user", content: prompt }],
+    messages,
     temperature: config.temperature ?? 0.2,
     max_tokens: config.maxTokens ?? 2_048,
     stream: false,
@@ -447,7 +463,7 @@ export function buildSuggestionRequestBody(
  * can be inspected afterwards.
  */
 export async function requestSuggestion(
-  prompt: string,
+  promptOrMessages: string | SuggestionMessage[],
   config: SuggestLlmConfig,
   cwd: string,
   externalSignal?: AbortSignal,
@@ -455,7 +471,13 @@ export async function requestSuggestion(
   const apiKey = resolveApiKey(config);
   const url = chatCompletionsUrl(config.baseUrl);
   const modelLabel = `${config.model} @ ${config.baseUrl}`;
-  logPrompt(prompt, modelLabel, cwd);
+  const logText =
+    typeof promptOrMessages === "string"
+      ? promptOrMessages
+      : promptOrMessages
+          .map((message) => `[${message.role}]\n${message.content}`)
+          .join("\n\n");
+  logPrompt(logText, modelLabel, cwd);
 
   const timeoutMs = Math.max(5_000, config.timeoutMs ?? 60_000);
   const timeoutController = new AbortController();
@@ -473,7 +495,9 @@ export async function requestSuggestion(
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiKey}`,
         },
-        body: JSON.stringify(buildSuggestionRequestBody(prompt, config)),
+        body: JSON.stringify(
+          buildSuggestionRequestBody(promptOrMessages, config),
+        ),
         signal,
       });
     } catch (error) {
@@ -525,6 +549,23 @@ export async function requestSuggestion(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Follow-up instruction used when the user asks to include more earlier work.
+ * It is appended to the same conversation so the initial prompt and the
+ * previous assistant reply stay in the prefix cache.
+ */
+export function buildExpansionPrompt(currentTurn: number): string {
+  return [
+    `当前建议是 turn ${currentTurn}。`,
+    "请把范围再往前扩大：选择更早的一个 turn（必须小于当前 turn），把更早的相关工作也包含进来，使两个或更多相关事件合并成一次压缩。",
+    "要求：仍然输出与之前相同格式的 JSON；不要选择 summary 占位符。",
+    "description 用 2-4 句话说明新的起点包含的内容，以及为什么在这里切分。",
+    "",
+    '{"turn":N,"description":"..."}',
+    '或 {"turn":null,"reason":"..."}',
+  ].join("\n");
 }
 
 // ---- response parsing -----------------------------------------------------

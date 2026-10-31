@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 import {
+  buildExpansionPrompt,
   buildSuggestPrompt,
   buildSuggestTranscript,
   buildSuggestionRequestBody,
@@ -394,4 +395,27 @@ test("parseModelIds dedupes, sorts, and ignores invalid entries", () => {
   );
   assert.deepEqual(parseModelIds({}), []);
   assert.deepEqual(parseModelIds(null), []);
+});
+
+test("request body preserves conversation messages for prefix-cache reuse", () => {
+  const messages = [
+    { role: "user" as const, content: "initial transcript" },
+    { role: "assistant" as const, content: '{"turn":5,"description":"old"}' },
+    { role: "user" as const, content: "expand earlier" },
+  ];
+  const body = buildSuggestionRequestBody(messages, {
+    baseUrl: "https://api.deepseek.com",
+    model: "deepseek-flash",
+    thinking: "disabled",
+  });
+  assert.deepEqual(body.messages, messages);
+  assert.deepEqual(body.thinking, { type: "disabled" });
+});
+
+test("expansion prompt requires an earlier turn and the same JSON shape", () => {
+  const prompt = buildExpansionPrompt(5);
+  assert.ok(prompt.includes("turn 5"));
+  assert.ok(prompt.includes("更早"));
+  assert.ok(prompt.includes("必须小于当前 turn"));
+  assert.ok(prompt.includes('{"turn":N,"description":"..."}'));
 });
