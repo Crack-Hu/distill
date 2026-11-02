@@ -87,10 +87,11 @@ LLM 只返回目标 turn 和 2-4 句说明；标签名由扩展自动生成 `sug
 
 - **Accept** — 只写入标签，之后可手动执行 `/distill <label>`
 - **Accept and distill** — 写入标签并立即进入正常的压缩流程（摘要确认、旧会话处理）
-- **Move start label earlier** — 在当前建议基础上再往前找一个更早的 turn，把更多相关工作合并进同一次压缩；模型必须给出更早的位置，否则保留当前建议。可以重复选择，逐步向前扩大（当前 turn 为 1 时不显示）
+- **Move start label earlier** — 在当前建议基础上再往前找一个更早的 turn，把更多相关工作合并进同一次压缩；模型必须给出更早的位置，否则保留当前建议。可以重复选择，逐步向前扩大（当前 turn 之前没有 user turn 时不显示）
+- **Move start label later** — 在当前建议基础上往后找一个更晚的 turn，把起点移到更靠近当前会话末尾的位置，减少被压缩的内容；模型必须给出更晚的位置，否则保留当前建议。可以重复选择，逐步向后缩小（当前 turn 之后没有 user turn 时不显示）
 - **Reject** — 不修改会话
 
-选择 Move start label earlier 时不会重新发送完整 prompt：第一次请求的 user 消息、模型返回的 JSON、以及之前每一次扩展的指令都保留在同一个 `messages` 数组里，只追加一条新的 user 指令。DeepSeek 等支持自动前缀缓存的端点会复用前面的 prefix，只有新增部分需要重新计算，因此比重新发一遍完整对话更快、更省 token。
+选择 Move start label earlier / later 时不会重新发送完整 prompt：第一次请求的 user 消息、模型返回的 JSON、以及之前每一次调整的指令都保留在同一个 `messages` 数组里，只追加一条新的 user 指令。DeepSeek 等支持自动前缀缓存的端点会复用前面的 prefix，只有新增部分需要重新计算，因此比重新发一遍完整对话更快、更省 token。
 
 已有标签不会交给 LLM 处理。如果最终目标 turn 已经有标签，会在你选择 Accept / Accept and distill 后弹窗提醒，确认后才覆盖。
 

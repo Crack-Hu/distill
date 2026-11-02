@@ -26,9 +26,11 @@ import {
   buildExpansionPrompt,
   buildSuggestPrompt,
   buildSuggestTranscript,
+  isExpansionInDirection,
   nextSuggestLabelName,
   parseSuggestion,
   requestSuggestion,
+  type ExpansionDirection,
   type LabelSuggestion,
   type SuggestionMessage,
 } from "../engine/suggest";
@@ -43,6 +45,7 @@ const CHOICES = {
   ACCEPT: "Accept",
   ACCEPT_DISTILL: "Accept and distill",
   MOVE_EARLIER: "Move start label earlier",
+  MOVE_LATER: "Move start label later",
   REJECT: "Reject",
 } as const;
 
@@ -230,24 +233,36 @@ export async function handleSuggestLabel(
 
   let choice: string | undefined;
   for (;;) {
-    const canExpand = current.suggestion.turn > 1;
-    const options = canExpand
-      ? [
-          CHOICES.ACCEPT,
-          CHOICES.ACCEPT_DISTILL,
-          CHOICES.MOVE_EARLIER,
-          CHOICES.REJECT,
-        ]
-      : [CHOICES.ACCEPT, CHOICES.ACCEPT_DISTILL, CHOICES.REJECT];
+    const canMoveEarlier = transcript.turns.some(
+      (turn) => turn.kind === "user" && turn.index < current.suggestion.turn,
+    );
+    const canMoveLater = transcript.turns.some(
+      (turn) => turn.kind === "user" && turn.index > current.suggestion.turn,
+    );
+
+    const options: string[] = [CHOICES.ACCEPT, CHOICES.ACCEPT_DISTILL];
+    if (canMoveEarlier) options.push(CHOICES.MOVE_EARLIER);
+    if (canMoveLater) options.push(CHOICES.MOVE_LATER);
+    options.push(CHOICES.REJECT);
 
     choice = await ctx.ui.select(
       suggestionTitle(current.suggestion, label),
       options,
     );
-    if (choice !== CHOICES.MOVE_EARLIER) break;
 
-    if (!canExpand) {
-      ctx.ui.notify("There is no earlier turn to include.", "warning");
+    const direction: ExpansionDirection | undefined =
+      choice === CHOICES.MOVE_EARLIER
+        ? "earlier"
+        : choice === CHOICES.MOVE_LATER
+          ? "later"
+          : undefined;
+    if (!direction) break;
+
+    if (
+      (direction === "earlier" && !canMoveEarlier) ||
+      (direction === "later" && !canMoveLater)
+    ) {
+      ctx.ui.notify(`There is no ${direction} turn to include.`, "warning");
       continue;
     }
 
@@ -256,7 +271,7 @@ export async function handleSuggestLabel(
       { role: "assistant", content: current.raw },
       {
         role: "user",
-        content: buildExpansionPrompt(current.suggestion.turn),
+        content: buildExpansionPrompt(current.suggestion.turn, direction),
       },
     ];
 
@@ -266,7 +281,9 @@ export async function handleSuggestLabel(
         expandMessages,
         suggestConfig,
         ctx,
-        "Looking further back…",
+        direction === "earlier"
+          ? "Looking further back…"
+          : "Looking further ahead…",
       );
     } catch (error) {
       ctx.ui.notify(errorMessage(error), "error");
@@ -285,18 +302,27 @@ export async function handleSuggestLabel(
       continue;
     }
     if (parsed.kind === "none") {
-      ctx.ui.notify(`No earlier label suggested: ${parsed.reason}`, "info");
+      ctx.ui.notify(`No ${direction} label suggested: ${parsed.reason}`, "info");
       continue;
     }
 
-    const target = transcript.turns[parsed.turn - 1];
-    if (parsed.turn >= current.suggestion.turn) {
+    if (
+      !isExpansionInDirection(
+        current.suggestion.turn,
+        parsed.turn,
+        direction,
+      )
+    ) {
       ctx.ui.notify(
-        "The model did not choose an earlier turn; keeping the current suggestion.",
+        `The model did not choose ${
+          direction === "earlier" ? "an earlier" : "a later"
+        } turn; keeping the current suggestion.`,
         "warning",
       );
       continue;
     }
+
+    const target = transcript.turns[parsed.turn - 1];
     if (target.kind !== "user") {
       ctx.ui.notify(
         "The model chose a summary placeholder; keeping the current suggestion.",

@@ -551,21 +551,43 @@ export async function requestSuggestion(
   }
 }
 
+/** Direction the user wants the suggested start label to move. */
+export type ExpansionDirection = "earlier" | "later";
+
 /**
- * Follow-up instruction used when the user asks to include more earlier work.
- * It is appended to the same conversation so the initial prompt and the
+ * Follow-up instruction used when the user asks to adjust the suggested start
+ * label. It is appended to the same conversation so the initial prompt and the
  * previous assistant reply stay in the prefix cache.
  */
-export function buildExpansionPrompt(currentTurn: number): string {
+export function buildExpansionPrompt(
+  currentTurn: number,
+  direction: ExpansionDirection = "earlier",
+): string {
+  const instruction =
+    direction === "earlier"
+      ? "请把范围再往前扩大：选择更早的一个 turn（必须小于当前 turn），把更早的相关工作也包含进来，使两个或更多相关事件合并成一次压缩。"
+      : "请把范围往后缩小：选择更晚的一个 turn（必须大于当前 turn），把起点移到更靠近当前会话末尾的位置，减少被压缩的内容。";
+
   return [
     `当前建议是 turn ${currentTurn}。`,
-    "请把范围再往前扩大：选择更早的一个 turn（必须小于当前 turn），把更早的相关工作也包含进来，使两个或更多相关事件合并成一次压缩。",
+    instruction,
     "要求：仍然输出与之前相同格式的 JSON；不要选择 summary 占位符。",
     "description 用 2-4 句话说明新的起点包含的内容，以及为什么在这里切分。",
     "",
     '{"turn":N,"description":"..."}',
     '或 {"turn":null,"reason":"..."}',
   ].join("\n");
+}
+
+/** Whether `nextTurn` moved in the requested direction from `currentTurn`. */
+export function isExpansionInDirection(
+  currentTurn: number,
+  nextTurn: number,
+  direction: ExpansionDirection,
+): boolean {
+  return direction === "earlier"
+    ? nextTurn < currentTurn
+    : nextTurn > currentTurn;
 }
 
 // ---- response parsing -----------------------------------------------------

@@ -15,6 +15,7 @@ import {
   buildSuggestTranscript,
   buildSuggestionRequestBody,
   formatSuggestTranscript,
+  isExpansionInDirection,
   modelsUrl,
   nextSuggestLabelName,
   parseModelIds,
@@ -412,10 +413,28 @@ test("request body preserves conversation messages for prefix-cache reuse", () =
   assert.deepEqual(body.thinking, { type: "disabled" });
 });
 
-test("expansion prompt requires an earlier turn and the same JSON shape", () => {
+test("expansion prompt defaults to an earlier turn and keeps the JSON shape", () => {
   const prompt = buildExpansionPrompt(5);
   assert.ok(prompt.includes("turn 5"));
   assert.ok(prompt.includes("更早"));
   assert.ok(prompt.includes("必须小于当前 turn"));
   assert.ok(prompt.includes('{"turn":N,"description":"..."}'));
+});
+
+test("expansion prompt supports moving the start label later", () => {
+  const prompt = buildExpansionPrompt(5, "later");
+  assert.ok(prompt.includes("turn 5"));
+  assert.ok(prompt.includes("更晚"));
+  assert.ok(prompt.includes("必须大于当前 turn"));
+  assert.ok(prompt.includes('{"turn":N,"description":"..."}'));
+});
+
+test("expansion direction validation rejects equal or opposite moves", () => {
+  assert.equal(isExpansionInDirection(5, 3, "earlier"), true);
+  assert.equal(isExpansionInDirection(5, 5, "earlier"), false);
+  assert.equal(isExpansionInDirection(5, 7, "earlier"), false);
+
+  assert.equal(isExpansionInDirection(5, 7, "later"), true);
+  assert.equal(isExpansionInDirection(5, 5, "later"), false);
+  assert.equal(isExpansionInDirection(5, 3, "later"), false);
 });

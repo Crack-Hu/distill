@@ -17,7 +17,7 @@
 |------|------|
 | `index.ts` | 扩展入口，注册命令、守卫、工具 |
 | `src/commands/distill.ts` | `/distill` 子命令分发、范围消歧、摘要确认、会话重建、旧会话处理、会话守卫 |
-| `src/commands/suggest-label.ts` | `suggest_lab` 交互、进度面板、Accept / Move earlier / Reject |
+| `src/commands/suggest-label.ts` | `suggest_lab` 交互、进度面板、Accept / Move earlier/later / Reject |
 | `src/engine/compact.ts` | 压缩引擎：范围、segment、分支检测、rebuild plan、摘要生成 |
 | `src/engine/turn-group.ts` | turn 分组、label 解析、路径与子树遍历 |
 | `src/engine/prompt.ts` | 摘要 prompt 渲染、`formatMessages` |
