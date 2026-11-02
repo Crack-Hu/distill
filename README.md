@@ -23,7 +23,7 @@ pi install https://github.com/Crack-Hu/distill
 > 扩展零依赖，安装后即可使用，无需 `npm install`。
 > 安装目录会带有 `config.json.example`；推荐复制到 `~/.pi/agent/distill/config.json`（稳定全局配置，扩展更新/重装不会丢），也可以放到 `<cwd>/.pi/distill/config.json` 只覆盖当前项目。
 > 不配置也能使用 `/distill`（默认复用当前会话模型）。
-> 本地开发可用 `pi -e ./index.ts` 直接加载。
+> 本地开发用 `pi --no-extensions -e ./index.ts` 加载本地代码；不要同时加载已安装版本，否则同名工具（如 `view_distilled_context`）会冲突。
 
 ---
 
